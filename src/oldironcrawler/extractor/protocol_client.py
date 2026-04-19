@@ -89,7 +89,7 @@ _INCAPSULA_CHALLENGE_HINTS = (
     "imperva",
 )
 _NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-_REQUEST_SLOT_LIMIT = max(int(os.getenv("PROTOCOL_REQUEST_SLOTS", "128") or "128"), 1)
+_REQUEST_SLOT_LIMIT = max(int(os.getenv("PROTOCOL_REQUEST_SLOTS", "52") or "52"), 1)
 _REQUEST_SLOT_SEMAPHORE = threading.BoundedSemaphore(_REQUEST_SLOT_LIMIT)
 _SITE_DEADLINE_SAFETY_SECONDS = 8.0
 class ProtocolTemporaryError(RuntimeError):
@@ -124,7 +124,7 @@ class SiteProtocolConfig:
     page_batch_timeout_seconds: float = 45.0
     deadline_monotonic: float | None = None
     common_probe_target: int = 8
-    common_probe_concurrency: int = 8
+    common_probe_concurrency: int = 52
     common_probe_patience_batches: int = 2
     common_probe_min_hits_after_patience: int = 2
     related_seed_limit: int = 2
@@ -200,6 +200,8 @@ class SiteProtocolClient:
         return HtmlPage(url=url, html=html_text)
     def fetch_pages(self, urls: list[str], *, max_workers: int, page_pool: PageFetchPool | None = None) -> list[HtmlPage]:
         pages: list[HtmlPage] = []
+        last_error: Exception | None = None
+        timed_out = False
         filtered = [url for url in urls if _is_supported_url(url)]
         deadline = time.monotonic() + max(self._config.page_batch_timeout_seconds, 0.01)
         if self._config.deadline_monotonic is not None:
@@ -213,13 +215,19 @@ class SiteProtocolClient:
         for url in filtered:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                timed_out = True
                 break
             try:
                 page = self._fetch_page_optional(url, timeout_seconds=min(self._config.timeout_seconds, remaining))
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
                 continue
             if page is not None and page.html.strip():
                 pages.append(page)
+        if not pages and last_error is not None:
+            raise last_error
+        if not pages and timed_out:
+            raise TimeoutError("page_batch_timeout")
         return pages
     def _fetch_page_optional(self, url: str, *, timeout_seconds: float | None = None) -> HtmlPage | None:
         session = self._get_or_create_session()
@@ -325,7 +333,7 @@ class SiteProtocolClient:
                         response.close()
                     except Exception:  # noqa: BLE001
                         pass
-        if required:
+        if last_error is not None:
             raise ProtocolTemporaryError(str(last_error or f"temporary_request: {url}"))
         return ""
 

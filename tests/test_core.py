@@ -262,13 +262,15 @@ def test_page_fetch_pool_limits_submissions_under_short_deadline(monkeypatch) ->
         time.sleep(0.2)
         return url
 
-    pages = pool.fetch_pages(
-        urls=[f"https://a.com/{index}" for index in range(20)],
-        fetch_one=fetch_one,
-        deadline_monotonic=time.monotonic() + 0.05,
-    )
-
-    assert pages == []
+    try:
+        pool.fetch_pages(
+            urls=[f"https://a.com/{index}" for index in range(20)],
+            fetch_one=fetch_one,
+            deadline_monotonic=time.monotonic() + 0.05,
+        )
+        raise AssertionError("expected TimeoutError")
+    except TimeoutError as exc:
+        assert "page_batch_timeout" in str(exc)
     assert submit_count <= 2
     pool.close()
 
@@ -310,6 +312,9 @@ def test_protocol_client_falls_back_to_http_on_https_tls_errors() -> None:
             raise AssertionError(url)
 
     client = SiteProtocolClient(SiteProtocolConfig())
+    client._try_httpx_fallback = lambda _url, _lowered_error: None
+    client._try_insecure_https_fallback = lambda _url, _lowered_error: None
+    client._try_www_fallback = lambda _session, _url, _lowered_error: None
 
     html = client._fetch_html(FakeSession(), "https://example.com", required=True)
 

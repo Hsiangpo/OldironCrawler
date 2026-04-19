@@ -416,8 +416,8 @@ def _get_llm_semaphore() -> threading.Semaphore:
     global _LLM_SEMAPHORE_LIMIT
     with _LLM_SEMAPHORE_LOCK:
         if _LLM_SEMAPHORE is None:
-            _LLM_SEMAPHORE = threading.Semaphore(8)
-            _LLM_SEMAPHORE_LIMIT = 8
+            _LLM_SEMAPHORE = threading.Semaphore(52)
+            _LLM_SEMAPHORE_LIMIT = 52
         return _LLM_SEMAPHORE
 
 

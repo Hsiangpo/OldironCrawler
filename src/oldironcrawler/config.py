@@ -83,6 +83,11 @@ class AppConfig:
     page_concurrency: int
     page_worker_count: int
     page_host_limit: int
+    rep_page_limit: int
+    email_page_soft_limit: int
+    email_page_hard_limit: int
+    page_total_hard_limit: int
+    email_stop_same_domain_count: int
     request_timeout_seconds: float
     total_wait_seconds: float
 
@@ -99,7 +104,7 @@ class AppConfig:
             llm_model=str(os.getenv("LLM_MODEL", "gpt-5.4-mini") or "").strip(),
             llm_reasoning_effort=str(os.getenv("LLM_REASONING_EFFORT", "low") or "").strip(),
             llm_api_style=str(os.getenv("LLM_API_STYLE", "responses") or "").strip().lower(),
-            llm_concurrency=max(_env_int("LLM_CONCURRENCY", 64), 1),
+            llm_concurrency=max(_env_int("LLM_CONCURRENCY", 52), 1),
             capsolver_api_key=str(os.getenv("CAPSOLVER_API_KEY", "") or "").strip(),
             capsolver_api_base_url=str(os.getenv("CAPSOLVER_API_BASE_URL", "https://api.capsolver.com") or "").strip(),
             capsolver_proxy=str(os.getenv("CAPSOLVER_PROXY", "") or "").strip(),
@@ -107,10 +112,15 @@ class AppConfig:
             capsolver_max_wait_seconds=max(_env_float("CAPSOLVER_MAX_WAIT_SECONDS", 40.0), 5.0),
             cloudflare_proxy_url=str(os.getenv("CLOUDFLARE_PROXY_URL", "") or "").strip(),
             proxy_url=_resolve_proxy_url(),
-            site_concurrency=max(_env_int("SITE_CONCURRENCY", 64), 1),
-            page_concurrency=max(_env_int("PAGE_CONCURRENCY", 8), 1),
-            page_worker_count=max(_env_int("PAGE_WORKER_COUNT", 192), 1),
-            page_host_limit=max(_env_int("PAGE_HOST_LIMIT", 8), 1),
+            site_concurrency=max(_env_int("SITE_CONCURRENCY", 52), 1),
+            page_concurrency=max(_env_int("PAGE_CONCURRENCY", 52), 1),
+            page_worker_count=max(_env_int("PAGE_WORKER_COUNT", 52), 1),
+            page_host_limit=max(_env_int("PAGE_HOST_LIMIT", 52), 1),
+            rep_page_limit=max(_env_int("REP_PAGE_LIMIT", 5), 1),
+            email_page_soft_limit=max(_env_int("EMAIL_PAGE_SOFT_LIMIT", 8), 0),
+            email_page_hard_limit=max(_env_int("EMAIL_PAGE_HARD_LIMIT", 16), 0),
+            page_total_hard_limit=max(_env_int("PAGE_TOTAL_HARD_LIMIT", 20), 1),
+            email_stop_same_domain_count=max(_env_int("EMAIL_STOP_SAME_DOMAIN_COUNT", 2), 1),
             request_timeout_seconds=max(_env_float("REQUEST_TIMEOUT_SECONDS", 10.0), 1.0),
             total_wait_seconds=max(_env_float("TOTAL_WAIT_SECONDS", 180.0), 30.0),
         )

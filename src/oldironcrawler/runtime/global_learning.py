@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 _SUCCESS_DELTA = 3
 _FAILURE_DELTA = 1
 _MIN_SCORE = -12
 _MAX_SCORE = 60
+_DECAY_WINDOW_DAYS = 14
+_DECAY_STEP = 1
+_POSITIVE_DECAY_FLOOR = 1
+_SQLITE_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 class GlobalLearningStore:
@@ -27,7 +32,8 @@ class GlobalLearningStore:
             _close_connection_quietly(conn)
 
     def load_scores(self, kind: str) -> dict[str, int]:
-        with self._connect() as conn:
+        with self._write_lock, self._connect() as conn:
+            _apply_lazy_positive_decay(conn, kind)
             rows = conn.execute(
                 """
                 SELECT feature, score
@@ -154,4 +160,57 @@ def _close_connection_quietly(conn: sqlite3.Connection) -> None:
     try:
         conn.close()
     except sqlite3.Error:
+        return None
+
+
+def _apply_lazy_positive_decay(conn: sqlite3.Connection, kind: str) -> None:
+    rows = conn.execute(
+        """
+        SELECT feature, score, updated_at
+        FROM learning_features
+        WHERE kind = ? AND score > 0
+        """,
+        (kind,),
+    ).fetchall()
+    if not rows:
+        return
+    now = datetime.now(timezone.utc)
+    now_text = now.strftime(_SQLITE_TIMESTAMP_FORMAT)
+    for row in rows:
+        score = int(row["score"] or 0)
+        updated_at = str(row["updated_at"] or "").strip()
+        decayed_score, should_refresh = _decay_positive_score(score, updated_at, now)
+        if not should_refresh:
+            continue
+        conn.execute(
+            """
+            UPDATE learning_features
+            SET score = ?, updated_at = ?
+            WHERE kind = ? AND feature = ?
+            """,
+            (decayed_score, now_text, kind, str(row["feature"])),
+        )
+
+
+def _decay_positive_score(score: int, updated_at: str, now: datetime) -> tuple[int, bool]:
+    if score <= 0:
+        return score, False
+    last_updated = _parse_sqlite_timestamp(updated_at)
+    if last_updated is None:
+        return score, False
+    elapsed_seconds = max((now - last_updated).total_seconds(), 0.0)
+    decay_windows = int(elapsed_seconds // (_DECAY_WINDOW_DAYS * 24 * 60 * 60))
+    if decay_windows <= 0:
+        return score, False
+    next_score = max(score - (decay_windows * _DECAY_STEP), _POSITIVE_DECAY_FLOOR)
+    return next_score, True
+
+
+def _parse_sqlite_timestamp(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, _SQLITE_TIMESTAMP_FORMAT).replace(tzinfo=timezone.utc)
+    except ValueError:
         return None

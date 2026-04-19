@@ -342,6 +342,43 @@ def select_email_urls(candidates: list[UrlCandidate]) -> list[str]:
     return urls
 
 
+def build_fetch_plan(
+    start_url: str,
+    rep_urls: list[str],
+    email_urls: list[str],
+    *,
+    rep_limit: int,
+    email_soft_limit: int,
+    email_hard_limit: int,
+    total_hard_limit: int,
+) -> dict[str, list[str]]:
+    rep_cap = max(min(rep_limit, total_hard_limit), 0)
+    selected_rep_urls = _take_unique_urls(rep_urls, limit=rep_cap, priority_url=start_url)
+    homepage_primary_urls = _select_homepage_primary_urls(
+        start_url,
+        selected_rep_urls,
+        total_hard_limit=total_hard_limit,
+    )
+    email_candidates = _exclude_existing_urls(
+        _take_unique_urls(email_urls, limit=max(len(email_urls), 0), priority_url=start_url),
+        [*selected_rep_urls, *homepage_primary_urls],
+    )
+    email_total_cap = max(
+        min(email_hard_limit, total_hard_limit - len(selected_rep_urls) - len(homepage_primary_urls)),
+        0,
+    )
+    email_primary_cap = max(min(email_soft_limit, email_total_cap), 0)
+    email_primary_urls = email_candidates[:email_primary_cap]
+    email_overflow_urls = email_candidates[email_primary_cap:email_total_cap]
+    return {
+        "rep_urls": selected_rep_urls,
+        "homepage_primary_urls": homepage_primary_urls,
+        "email_primary_urls": email_primary_urls,
+        "email_overflow_urls": email_overflow_urls,
+        "all_primary_urls": [*selected_rep_urls, *homepage_primary_urls, *email_primary_urls],
+    }
+
+
 def extract_learning_tokens(url: str) -> list[str]:
     return _build_learning_tokens(extract_path_tokens(url))
 
@@ -519,6 +556,50 @@ def _extract_locale_token_from_url(url: str) -> str:
     if re.fullmatch(r"[a-z]{2}(?:-[a-z]{2})?", first):
         return first
     return ""
+
+
+def _take_unique_urls(urls: list[str], *, limit: int, priority_url: str) -> list[str]:
+    ordered_urls = _promote_priority_url(urls, priority_url)
+    result: list[str] = []
+    seen: set[str] = set()
+    for url in ordered_urls:
+        value = str(url or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _exclude_existing_urls(urls: list[str], existing_urls: list[str]) -> list[str]:
+    blocked = {str(url or "").strip() for url in existing_urls if str(url or "").strip()}
+    return [url for url in urls if str(url or "").strip() not in blocked]
+
+
+def _promote_priority_url(urls: list[str], priority_url: str) -> list[str]:
+    priority = str(priority_url or "").strip()
+    ordered_urls = [str(url or "").strip() for url in urls if str(url or "").strip()]
+    if not priority or priority not in ordered_urls:
+        return ordered_urls
+    return [priority, *[url for url in ordered_urls if url != priority]]
+
+
+def _select_homepage_primary_urls(
+    start_url: str,
+    selected_rep_urls: list[str],
+    *,
+    total_hard_limit: int,
+) -> list[str]:
+    homepage_url = str(start_url or "").strip()
+    if not homepage_url:
+        return []
+    if homepage_url in selected_rep_urls:
+        return []
+    if len(selected_rep_urls) >= total_hard_limit:
+        return []
+    return [homepage_url]
 
 
 def _looks_like_person_detail_page(tokens: list[str]) -> bool:

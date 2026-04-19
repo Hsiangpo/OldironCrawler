@@ -29,6 +29,8 @@ class PageFetchPool:
     ) -> list:
         futures: dict[Future, str] = {}
         pages_by_url: dict[str, object] = {}
+        last_error: Exception | None = None
+        timed_out = False
         inflight_limit = self._inflight_limit(urls)
         url_index = 0
         try:
@@ -43,15 +45,18 @@ class PageFetchPool:
             while futures:
                 remaining = deadline_monotonic - _now_monotonic()
                 if remaining <= 0:
+                    timed_out = True
                     break
                 done, _ = wait(futures.keys(), timeout=remaining, return_when=FIRST_COMPLETED)
                 if not done:
+                    timed_out = True
                     break
                 for future in done:
                     url = futures.pop(future, "")
                     try:
                         page = future.result()
-                    except Exception:  # noqa: BLE001
+                    except Exception as exc:  # noqa: BLE001
+                        last_error = exc
                         continue
                     if page is not None and url:
                         pages_by_url[url] = page
@@ -67,6 +72,10 @@ class PageFetchPool:
             for future in futures:
                 if not future.done():
                     future.cancel()
+        if not pages_by_url and last_error is not None:
+            raise last_error
+        if not pages_by_url and timed_out:
+            raise TimeoutError("page_batch_timeout")
         return [pages_by_url[url] for url in urls if url in pages_by_url]
 
     def _inflight_limit(self, urls: list[str]) -> int:
