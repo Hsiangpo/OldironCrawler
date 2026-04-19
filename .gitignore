@@ -5,3 +5,5 @@ __pycache__/
 *.pyc
 .pytest_cache/
 output/
+tmp/
+.codex/skills/protocol-crawler/.env_checked
