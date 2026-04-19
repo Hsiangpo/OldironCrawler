@@ -6,7 +6,7 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlparse
@@ -136,6 +136,7 @@ class SiteProtocolClient:
     def __init__(self, config: SiteProtocolConfig) -> None:
         self._config = config
         self._http_client = self._build_httpx_client()
+        self._probe_executor = ThreadPoolExecutor(max_workers=max(config.common_probe_concurrency, 1))
         self._session_lock = threading.Lock()
         self._thread_sessions: dict[int, cffi_requests.Session] = {}
 
@@ -148,6 +149,10 @@ class SiteProtocolClient:
                 session.close()
             except Exception:  # noqa: BLE001
                 pass
+        try:
+            self._probe_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             self._http_client.close()
         except Exception:  # noqa: BLE001
@@ -256,8 +261,10 @@ class SiteProtocolClient:
         *,
         required: bool,
         timeout_seconds: float | None = None,
+        max_retries_override: int | None = None,
     ) -> str:
-        attempts = max(self._config.max_retries, 0) + 1
+        retries = self._config.max_retries if max_retries_override is None else max(max_retries_override, 0)
+        attempts = retries + 1
         last_error: Exception | None = None
         for _ in range(attempts):
             response = None
@@ -296,6 +303,9 @@ class SiteProtocolClient:
                 httpx_html = self._try_httpx_fallback(url, lowered)
                 if httpx_html is not None:
                     return httpx_html
+                insecure_html = self._try_insecure_https_fallback(url, lowered)
+                if insecure_html is not None:
+                    return insecure_html
                 fallback_html = self._try_http_fallback(session, url, lowered)
                 if fallback_html is not None:
                     return fallback_html
@@ -403,6 +413,34 @@ class SiteProtocolClient:
             html_text = _truncate_html(response.text, self._config.max_html_chars)
             _raise_if_challenge_page(url, html_text)
             return html_text
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _try_insecure_https_fallback(self, url: str, lowered_error: str) -> str | None:
+        if not _should_try_http_fallback(url, lowered_error):
+            return None
+        request_timeout = self._resolve_timeout()
+        client_kwargs: dict[str, object] = {
+            "follow_redirects": True,
+            "headers": dict(self._config.default_headers),
+            "timeout": request_timeout,
+            "verify": False,
+            "trust_env": False,
+        }
+        if self._config.proxy_url:
+            client_kwargs["proxy"] = self._config.proxy_url
+        try:
+            with httpx.Client(**client_kwargs) as client:
+                with _request_slot(timeout_seconds=request_timeout):
+                    response = client.get(url, timeout=request_timeout)
+                if int(response.status_code) != 200:
+                    return None
+                content_type = str(response.headers.get("Content-Type", "") or "").lower()
+                if not _is_supported_response(url, content_type):
+                    return None
+                html_text = _truncate_html(response.text, self._config.max_html_chars)
+                _raise_if_challenge_page(url, html_text)
+                return html_text
         except Exception:  # noqa: BLE001
             return None
 
@@ -611,25 +649,38 @@ class SiteProtocolClient:
             return []
         futures: dict[Future, str] = {}
         results: list[str] = []
-        with ThreadPoolExecutor(max_workers=len(probe_urls)) as executor:
-            for probe_url in probe_urls:
-                futures[executor.submit(self._probe_common_value_url, probe_url)] = probe_url
-            done, pending = wait(futures.keys(), timeout=self._resolve_timeout())
-            for future in pending:
-                future.cancel()
+        wait_deadline = time.monotonic() + self._resolve_timeout()
+        for probe_url in probe_urls:
+            futures[self._probe_executor.submit(self._probe_common_value_url, probe_url)] = probe_url
+        while futures:
+            remaining = wait_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            done, _ = wait(futures.keys(), timeout=remaining, return_when=FIRST_COMPLETED)
+            if not done:
+                break
             for future in done:
+                futures.pop(future, None)
                 try:
                     keep = future.result()
                 except Exception:  # noqa: BLE001
                     continue
                 if keep:
                     results.append(str(keep))
+        for future in futures:
+            future.cancel()
         return results
 
     def _probe_common_value_url(self, probe_url: str) -> str | None:
         session = self._get_or_create_session()
         try:
-            html_text = self._fetch_html(session, probe_url, required=False)
+            html_text = self._fetch_html(
+                session,
+                probe_url,
+                required=False,
+                timeout_seconds=min(self._config.timeout_seconds, 4.0),
+                max_retries_override=0,
+            )
         except ProtocolPermanentError as exc:
             return probe_url if "challenge" in str(exc).lower() else None
         return probe_url if html_text.strip() else None

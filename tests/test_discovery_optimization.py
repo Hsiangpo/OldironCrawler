@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -52,6 +53,28 @@ def test_common_probe_scan_stops_after_low_yield_batches(monkeypatch) -> None:
 
     assert urls == []
     assert len(calls) == 2
+    client.close()
+
+
+def test_common_probe_batch_respects_batch_timeout_without_waiting_for_slow_futures(monkeypatch) -> None:
+    client = SiteProtocolClient(SiteProtocolConfig(common_probe_concurrency=4))
+
+    monkeypatch.setattr(client, "_resolve_timeout", lambda timeout_seconds=None: 0.05)
+
+    def fake_probe_common_value_url(_url: str) -> str | None:
+        time.sleep(0.2)
+        return None
+
+    monkeypatch.setattr(client, "_probe_common_value_url", fake_probe_common_value_url)
+
+    started = time.monotonic()
+    urls = client._probe_common_value_batch(
+        [f"https://example.com/path-{index}" for index in range(4)]
+    )
+    elapsed = time.monotonic() - started
+
+    assert urls == []
+    assert elapsed < 0.15
     client.close()
 
 
@@ -142,3 +165,21 @@ def test_build_candidates_does_not_substring_match_directory_contacts() -> None:
 
     assert candidate.rep_rule_score <= 0
     assert candidate.email_rule_score <= 0
+
+
+def test_extract_path_tokens_expands_common_joined_value_tokens() -> None:
+    candidates = build_candidates(
+        "https://example.com",
+        [
+            "https://example.com/contactus",
+            "https://example.com/executiveteam",
+        ],
+        {},
+        {},
+    )
+
+    contact_candidate = next(item for item in candidates if item.url.endswith("/contactus"))
+    executive_candidate = next(item for item in candidates if item.url.endswith("/executiveteam"))
+
+    assert contact_candidate.email_rule_score > 0
+    assert executive_candidate.rep_rule_score > 0

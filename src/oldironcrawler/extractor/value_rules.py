@@ -210,6 +210,17 @@ _LEARNING_STOP_TOKENS = {
     "with",
     "your",
 }
+_COMPOSITE_TOKEN_MAP = {
+    "aboutus": ["about", "us"],
+    "contactus": ["contact", "us"],
+    "executiveteam": ["executive", "team"],
+    "leadershipteam": ["leadership", "team"],
+    "managementteam": ["management", "team"],
+    "ourpeople": ["our", "people"],
+    "ourteam": ["our", "team"],
+    "privacypolicy": ["privacy", "policy"],
+    "teammembers": ["team", "members"],
+}
 
 
 @dataclass
@@ -363,12 +374,22 @@ def extract_path_tokens(url: str) -> list[str]:
     for part in parts:
         decoded = re.sub(r"\.[a-z0-9]{2,5}$", "", unquote(part).strip().lower())
         for token in re.split(r"[\W_]+", decoded, flags=re.UNICODE):
-            clean = token.strip().lower()
-            if len(clean) < 3:
-                continue
-            if clean not in tokens:
-                tokens.append(clean)
+            for clean in _expand_composite_token(token):
+                if len(clean) < 3:
+                    continue
+                if clean not in tokens:
+                    tokens.append(clean)
     return tokens
+
+
+def _expand_composite_token(token: str) -> list[str]:
+    clean = str(token or "").strip().lower()
+    if not clean:
+        return []
+    expanded = _COMPOSITE_TOKEN_MAP.get(clean)
+    if expanded:
+        return expanded
+    return [clean]
 
 
 def _family_key(tokens: list[str]) -> str:

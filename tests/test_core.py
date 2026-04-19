@@ -316,6 +316,44 @@ def test_protocol_client_falls_back_to_http_on_https_tls_errors() -> None:
     assert "fallback ok" in html
 
 
+def test_protocol_client_falls_back_to_insecure_https_on_expired_cert(monkeypatch) -> None:
+    class FakeResponse:
+        def __init__(self, status_code: int, text: str, content_type: str = "text/html") -> None:
+            self.status_code = status_code
+            self.text = text
+            self.headers = {"Content-Type": content_type}
+
+        def close(self) -> None:
+            return None
+
+    class FakeHttpxClient:
+        def __init__(self, **kwargs) -> None:
+            assert kwargs["verify"] is False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def get(self, url: str, timeout: float):
+            assert url == "https://example.com"
+            assert timeout == 10.0
+            return FakeResponse(200, "<html>insecure ok</html>")
+
+    class FakeSession:
+        def get(self, url: str, timeout: float):
+            raise RuntimeError("curl: (60) SSL certificate problem: certificate has expired")
+
+    client = SiteProtocolClient(SiteProtocolConfig())
+    monkeypatch.setattr(protocol_module.httpx, "Client", FakeHttpxClient)
+
+    html = client._fetch_html(FakeSession(), "https://example.com", required=True)
+
+    assert "insecure ok" in html
+    client.close()
+
+
 def test_protocol_client_falls_back_to_www_on_connection_closed() -> None:
     class FakeResponse:
         def __init__(self, status_code: int, text: str, content_type: str = "text/html") -> None:
@@ -1051,7 +1089,7 @@ def test_selection_deprioritizes_forum_and_sponsored_pages() -> None:
 def test_protocol_discovery_probes_common_value_paths_when_homepage_is_blocked(monkeypatch) -> None:
     client = SiteProtocolClient(SiteProtocolConfig())
 
-    def fake_fetch_html(_session, url: str, *, required: bool, timeout_seconds=None) -> str:
+    def fake_fetch_html(_session, url: str, *, required: bool, timeout_seconds=None, max_retries_override=None) -> str:
         if url == "https://example.com":
             raise ProtocolPermanentError("cloudflare_challenge: https://example.com")
         if url == "https://example.com/contact-us":
@@ -1071,7 +1109,7 @@ def test_protocol_discovery_probes_common_value_paths_when_homepage_is_blocked(m
 def test_protocol_discovery_keeps_challenged_common_value_paths(monkeypatch) -> None:
     client = SiteProtocolClient(SiteProtocolConfig())
 
-    def fake_fetch_html(_session, url: str, *, required: bool, timeout_seconds=None) -> str:
+    def fake_fetch_html(_session, url: str, *, required: bool, timeout_seconds=None, max_retries_override=None) -> str:
         if url == "https://example.com":
             return "<html>home</html>"
         if url == "https://example.com/executive-team":
