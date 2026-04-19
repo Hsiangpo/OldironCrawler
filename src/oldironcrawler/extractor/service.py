@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import time
 
 from oldironcrawler.config import AppConfig
-from oldironcrawler.extractor.company_rules import extract_company_name_fallback
+from oldironcrawler.extractor.company_rules import clean_company_name_candidate, extract_company_name_fallback
 from oldironcrawler.extractor.email_rules import analyze_email_set, collect_emails_for_pages, join_emails
 from oldironcrawler.extractor.llm_client import LlmExtractionResult, WebsiteLlmClient
 from oldironcrawler.extractor.page_pool import PageFetchPool
@@ -26,6 +26,28 @@ _DISCOVERY_SITEMAP_LIMIT = 80
 _DISCOVERY_RELATED_LIMIT = 40
 _DISCOVERY_FINAL_LIMIT = 160
 _DISCOVERY_EMAIL_FAMILY_TARGET = 6
+_DISCOVERY_REP_STRONG_TOKENS = {
+    "board",
+    "chair",
+    "chairman",
+    "chief",
+    "director",
+    "executive",
+    "founder",
+    "governance",
+    "impressum",
+    "imprint",
+    "leadership",
+    "management",
+    "officers",
+    "owner",
+    "partner",
+    "partners",
+    "president",
+    "principal",
+    "solicitor",
+    "team",
+}
 
 
 @dataclass
@@ -119,16 +141,16 @@ class SiteProfileService:
             metrics.fetched_page_count = len(page_map)
             self._store.update_stage_metrics(site_id, metrics)
             fetched_pages = list(page_map.values())
-            company_name = str(llm_result.company_name or "").strip()
+            company_name = clean_company_name_candidate(str(llm_result.company_name or "").strip())
             if not company_name:
-                company_name = self._time_call(
+                company_name = clean_company_name_candidate(self._time_call(
                     metrics,
                     "company_rule_ms",
                     lambda: extract_company_name_fallback(
                         website,
                         [(page.url, page.html) for page in fetched_pages],
                 ),
-            )
+            ))
             email_rule_pages = _collect_email_rule_pages(page_map, fetch_plan)
             emails, email_sources = self._time_call(
                 metrics,
@@ -362,7 +384,22 @@ def _build_discovery_snapshot(
 def _has_enough_discovery_coverage(snapshot: DiscoverySnapshot, *, rep_target_count: int = 5) -> bool:
     if len(snapshot.rep_urls) < rep_target_count:
         return False
-    return count_selected_families(snapshot.candidates, snapshot.email_urls) >= _DISCOVERY_EMAIL_FAMILY_TARGET
+    if count_selected_families(snapshot.candidates, snapshot.email_urls) < _DISCOVERY_EMAIL_FAMILY_TARGET:
+        return False
+    return _has_high_confidence_representative_coverage(snapshot)
+
+
+def _has_high_confidence_representative_coverage(snapshot: DiscoverySnapshot) -> bool:
+    candidate_map = {candidate.url: candidate for candidate in snapshot.candidates}
+    for url in snapshot.rep_urls:
+        candidate = candidate_map.get(url)
+        if candidate is None:
+            continue
+        if candidate.is_person_detail_page:
+            return True
+        if any(token in _DISCOVERY_REP_STRONG_TOKENS for token in candidate.tokens):
+            return True
+    return False
 
 
 def _plan_fetch_targets(config: AppConfig, website: str, rep_urls: list[str], email_urls: list[str]) -> dict[str, list[str]]:

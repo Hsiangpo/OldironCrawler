@@ -71,18 +71,24 @@ _REP_SOURCE_NEGATIVE_TOKENS = {
     "articles",
     "story",
     "stories",
+    "charitable",
+    "corporate",
     "media",
     "press",
     "release",
     "releases",
     "event",
     "events",
+    "foundation",
+    "fund",
+    "funds",
     "award",
     "awards",
     "insight",
     "insights",
     "resource",
     "resources",
+    "responsibility",
     "case",
     "study",
     "studies",
@@ -155,10 +161,12 @@ _PERSON_DETAIL_NON_NAME_TOKENS = _PERSON_DETAIL_CONTEXT_TOKENS | {
     "advice",
     "business",
     "certification",
+    "charitable",
     "coach",
     "coaching",
     "company",
     "commercial",
+    "corporate",
     "course",
     "courses",
     "cultures",
@@ -168,11 +176,16 @@ _PERSON_DETAIL_NON_NAME_TOKENS = _PERSON_DETAIL_CONTEXT_TOKENS | {
     "executive",
     "faq",
     "faqs",
+    "foundation",
+    "fund",
+    "funds",
     "group",
     "help",
     "home",
     "html",
     "index",
+    "investment",
+    "investments",
     "leaders",
     "management",
     "mentoring",
@@ -183,6 +196,7 @@ _PERSON_DETAIL_NON_NAME_TOKENS = _PERSON_DETAIL_CONTEXT_TOKENS | {
     "payroll",
     "private",
     "resolution",
+    "responsibility",
     "secretarial",
     "service",
     "services",
@@ -196,11 +210,14 @@ _PERSON_DETAIL_NON_NAME_TOKENS = _PERSON_DETAIL_CONTEXT_TOKENS | {
     "the",
     "training",
     "us",
+    "wealth",
 }
 _EMAIL_STRONG_SCORE = 12
 _EMAIL_STOP_SCORE = 8
 _EMAIL_HARD_LIMIT = 32
 _EMAIL_FAMILY_TARGET = 6
+_REP_POSITIVE_LEARN_CAP = 10
+_REP_PERSON_DETAIL_FINAL_BONUS = 8
 _LEARNING_STOP_TOKENS = {
     "and",
     "for",
@@ -221,6 +238,14 @@ _COMPOSITE_TOKEN_MAP = {
     "privacypolicy": ["privacy", "policy"],
     "teammembers": ["team", "members"],
 }
+_FAMILY_PREFIX_SKIP_TOKENS = {
+    "financial",
+    "advisers",
+    "individual",
+    "individuals",
+    "professional",
+    "professionals",
+}
 
 
 @dataclass
@@ -228,6 +253,7 @@ class UrlCandidate:
     url: str
     tokens: list[str]
     family_key: str
+    discovery_order: int
     depth: int
     rep_rule_score: int
     email_rule_score: int
@@ -238,7 +264,11 @@ class UrlCandidate:
 
     @property
     def rep_final_score(self) -> int:
-        return self.rep_rule_score + self.rep_learn_score - self.rep_noise_penalty
+        capped_rep_learn_score = self.rep_learn_score
+        if capped_rep_learn_score > _REP_POSITIVE_LEARN_CAP:
+            capped_rep_learn_score = _REP_POSITIVE_LEARN_CAP
+        person_detail_bonus = _REP_PERSON_DETAIL_FINAL_BONUS if self.is_person_detail_page else 0
+        return self.rep_rule_score + capped_rep_learn_score + person_detail_bonus - self.rep_noise_penalty
 
     @property
     def email_final_score(self) -> int:
@@ -257,12 +287,13 @@ def build_candidates(
         if value and value not in urls:
             urls.append(value)
     candidates: list[UrlCandidate] = []
-    for url in urls:
+    for discovery_order, url in enumerate(urls):
         path_tokens = extract_path_tokens(url)
+        trimmed_tokens = _trim_family_tokens(path_tokens)
         depth = max((urlparse(url).path or "").count("/"), 0)
         family_key = _family_key(path_tokens)
-        learning_tokens = _build_learning_tokens(path_tokens)
-        is_person_detail_page = _looks_like_person_detail_page(path_tokens)
+        is_person_detail_page = _looks_like_person_detail_page(trimmed_tokens)
+        learning_tokens = _build_learning_tokens(path_tokens, is_person_detail_page=is_person_detail_page)
         rep_rule_score = _score_tokens(path_tokens, _REP_WEIGHTS)
         email_rule_score = _score_tokens(path_tokens, _EMAIL_WEIGHTS)
         rep_rule_score += _path_phrase_bonus(url, kind="representative")
@@ -281,6 +312,7 @@ def build_candidates(
                 url=url,
                 tokens=learning_tokens,
                 family_key=family_key,
+                discovery_order=discovery_order,
                 depth=depth,
                 rep_rule_score=rep_rule_score - min(depth, 6) - locale_penalty,
                 email_rule_score=email_rule_score - min(depth, 6) - locale_penalty,
@@ -294,7 +326,7 @@ def build_candidates(
 
 
 def select_representative_urls(candidates: list[UrlCandidate], *, target_count: int = 5) -> tuple[list[str], list[str]]:
-    ordered = sorted(candidates, key=lambda item: (-item.rep_final_score, item.depth, item.url))
+    ordered = sorted(candidates, key=lambda item: (-item.rep_final_score, item.depth, item.discovery_order, item.url))
     selected: list[str] = []
     used_families: set[str] = set()
     used_person_families: set[str] = set()
@@ -380,14 +412,21 @@ def build_fetch_plan(
 
 
 def extract_learning_tokens(url: str) -> list[str]:
-    return _build_learning_tokens(extract_path_tokens(url))
+    path_tokens = extract_path_tokens(url)
+    return _build_learning_tokens(
+        path_tokens,
+        is_person_detail_page=_looks_like_person_detail_page(_trim_family_tokens(path_tokens)),
+    )
 
 
 def merge_representative_urls(base_urls: list[str], learned_urls: list[str], *, limit: int = 5) -> list[str]:
     urls: list[str] = []
+    seen: set[str] = set()
     for url in [*base_urls, *learned_urls]:
         value = str(url or "").strip()
-        if value and value not in urls:
+        canonical = _canonical_target_url(value)
+        if value and canonical not in seen:
+            seen.add(canonical)
             urls.append(value)
         if len(urls) >= limit:
             break
@@ -430,13 +469,14 @@ def _expand_composite_token(token: str) -> list[str]:
 
 
 def _family_key(tokens: list[str]) -> str:
-    if not tokens:
+    trimmed = _trim_family_tokens(tokens)
+    if not trimmed:
         return "root"
-    return "/".join(tokens[:2])
+    return "/".join(trimmed[:2])
 
 
-def _build_learning_tokens(path_tokens: list[str]) -> list[str]:
-    tokens = _filter_learning_tokens(path_tokens)
+def _build_learning_tokens(path_tokens: list[str], *, is_person_detail_page: bool = False) -> list[str]:
+    tokens = _filter_learning_tokens(path_tokens, is_person_detail_page=is_person_detail_page)
     family_feature = _family_feature(_family_key(tokens))
     if family_feature and family_feature not in tokens:
         tokens.append(family_feature)
@@ -449,10 +489,13 @@ def _family_feature(family_key: str) -> str:
     return f"family:{family_key}"
 
 
-def _filter_learning_tokens(path_tokens: list[str]) -> list[str]:
+def _filter_learning_tokens(path_tokens: list[str], *, is_person_detail_page: bool = False) -> list[str]:
+    blocked_tokens = set()
+    if is_person_detail_page:
+        blocked_tokens = set(_extract_person_name_tokens(_trim_family_tokens(path_tokens)))
     tokens: list[str] = []
     for token in path_tokens:
-        if token in _LEARNING_STOP_TOKENS or token in tokens:
+        if token in blocked_tokens or token in _LEARNING_STOP_TOKENS or token in tokens:
             continue
         tokens.append(token)
     return tokens
@@ -509,6 +552,8 @@ def _path_phrase_bonus(url: str, *, kind: str) -> int:
     for phrase, value in (
         ("discount-partners", -22),
         ("forums/", -28),
+        ("/our-services/", -14),
+        ("/services/", -8),
         ("sponsored_discussions", -28),
         ("member/email-options", -24),
     ):
@@ -516,11 +561,13 @@ def _path_phrase_bonus(url: str, *, kind: str) -> int:
             score += value
     if kind == "representative":
         for phrase, value in (
+            ("about-us/our-people", 24),
             ("about-us", 8),
             ("company-leadership", 18),
             ("executive-team", 18),
             ("leadership-team", 18),
             ("management-team", 16),
+            ("our-people", 18),
             ("our-team", 12),
             ("team-members", 16),
             ("executive-team", 18),
@@ -564,9 +611,10 @@ def _take_unique_urls(urls: list[str], *, limit: int, priority_url: str) -> list
     seen: set[str] = set()
     for url in ordered_urls:
         value = str(url or "").strip()
-        if not value or value in seen:
+        canonical = _canonical_target_url(value)
+        if not value or canonical in seen:
             continue
-        seen.add(value)
+        seen.add(canonical)
         result.append(value)
         if len(result) >= limit:
             break
@@ -574,16 +622,21 @@ def _take_unique_urls(urls: list[str], *, limit: int, priority_url: str) -> list
 
 
 def _exclude_existing_urls(urls: list[str], existing_urls: list[str]) -> list[str]:
-    blocked = {str(url or "").strip() for url in existing_urls if str(url or "").strip()}
-    return [url for url in urls if str(url or "").strip() not in blocked]
+    blocked = {_canonical_target_url(str(url or "").strip()) for url in existing_urls if str(url or "").strip()}
+    return [url for url in urls if _canonical_target_url(str(url or "").strip()) not in blocked]
 
 
 def _promote_priority_url(urls: list[str], priority_url: str) -> list[str]:
     priority = str(priority_url or "").strip()
     ordered_urls = [str(url or "").strip() for url in urls if str(url or "").strip()]
-    if not priority or priority not in ordered_urls:
+    if not priority:
         return ordered_urls
-    return [priority, *[url for url in ordered_urls if url != priority]]
+    priority_key = _canonical_target_url(priority)
+    matched = [url for url in ordered_urls if _canonical_target_url(url) == priority_key]
+    if not matched:
+        return ordered_urls
+    first = matched[0]
+    return [first, *[url for url in ordered_urls if _canonical_target_url(url) != priority_key]]
 
 
 def _select_homepage_primary_urls(
@@ -602,15 +655,42 @@ def _select_homepage_primary_urls(
     return [homepage_url]
 
 
+def _canonical_target_url(url: str) -> str:
+    parsed = urlparse(str(url or "").strip())
+    if not parsed.scheme or not parsed.netloc:
+        return str(url or "").strip().lower().rstrip("/")
+    host = str(parsed.netloc or "").strip().lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = str(parsed.path or "").rstrip("/")
+    query = str(parsed.query or "").strip()
+    if path == "/":
+        path = ""
+    if query:
+        return f"{parsed.scheme.lower()}://{host}{path}?{query}"
+    return f"{parsed.scheme.lower()}://{host}{path}"
+
+
+def _trim_family_tokens(tokens: list[str]) -> list[str]:
+    trimmed = list(tokens)
+    while trimmed and trimmed[0] in _FAMILY_PREFIX_SKIP_TOKENS:
+        trimmed = trimmed[1:]
+    return trimmed
+
+
 def _looks_like_person_detail_page(tokens: list[str]) -> bool:
     if len(tokens) < 3 or len(tokens) > 6:
         return False
     if not any(token in _PERSON_DETAIL_CONTEXT_TOKENS for token in tokens):
         return False
-    name_tokens = [
-        token for token in tokens
-        if token not in _PERSON_DETAIL_NON_NAME_TOKENS and token not in _NEGATIVE_TOKENS
-    ]
+    name_tokens = _extract_person_name_tokens(tokens)
     if len(name_tokens) < 2 or len(name_tokens) > 3:
         return False
     return all(token.isalpha() and len(token) >= 3 for token in name_tokens[:2])
+
+
+def _extract_person_name_tokens(tokens: list[str]) -> list[str]:
+    return [
+        token for token in tokens
+        if token not in _PERSON_DETAIL_NON_NAME_TOKENS and token not in _NEGATIVE_TOKENS
+    ]

@@ -18,6 +18,13 @@ from openai import OpenAI
 
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 _DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+_META_HEAD_SIGNAL_NAMES = {
+    "description",
+    "og:description",
+    "og:title",
+    "twitter:description",
+    "twitter:title",
+}
 _LLM_SEMAPHORE: threading.Semaphore | None = None
 _LLM_SEMAPHORE_LOCK = threading.Lock()
 _LLM_SEMAPHORE_LIMIT = 0
@@ -195,8 +202,10 @@ class WebsiteLlmClient:
             "14. evidence_url 必须尽量指向 about/team/leadership/management/board/governance/profile/contact/referrals/imprint/impressum 这类静态页面；如果只给新闻页而存在静态领导页，视为错误。\n"
             "15. 对律师事务所、会计师事务所、咨询公司这类专业服务站点，principal solicitor、founding director、named partner 这类角色可以视为最高负责人或核心代表人。\n"
             "16. 如果站点没有正式管理层页，但存在单独的人物详情页，并且该人物与公司主体、同域名邮箱、对外服务描述直接关联，也可以返回该自然人。\n"
-            "17. evidence_quote 必须包含代表人姓名原文，并且要能支撑这个人确实出现在页面中。\n"
-            "18. 找不到时可以留空，不要编造。\n\n"
+            "17. 页面标题、OG 标题、meta description 里的姓名和头衔也算官网明确内容；如果这些头部信号与静态人物页/联系页一致，可以作为有效证据。\n"
+            "18. 如果是明确以人物命名的静态页面，例如 Andy Maggs referrals、David Esfandi | Chief Executive Officer 这类，也可以把该人物视为核心代表人证据。\n"
+            "19. evidence_quote 必须包含代表人姓名原文，并且要能支撑这个人确实出现在页面中。\n"
+            "20. 找不到时可以留空，不要编造。\n\n"
             '返回 JSON：{"company_name":"","representative":"","evidence_url":"","evidence_quote":""}\n\n'
             f"首页: {homepage}\n"
             f"页面(JSON): {json.dumps(safe_pages, ensure_ascii=False)}"
@@ -224,10 +233,13 @@ class WebsiteLlmClient:
                 result.append({"url": url, "content": ""})
                 continue
             soup = BeautifulSoup(html_text, "lxml")
+            head_signals = _extract_head_signal_lines(soup)
             for tag in soup.find_all(remove_tags):
                 tag.decompose()
             content = MarkdownConverter().convert_soup(soup)
             content = re.sub(r"\n{3,}", "\n\n", content).strip()
+            if head_signals:
+                content = "\n".join(["--- 页面头部信号 ---", *head_signals, "", content]).strip()
             if len(content) > self._MAX_PAGE_CHARS:
                 half = self._MAX_PAGE_CHARS // 2
                 content = content[:half] + "\n\n...（内容过长已截断）...\n\n" + content[-half:]
@@ -539,6 +551,22 @@ def _prepare_representative_pages(pages: list[dict[str, str]]) -> list[dict[str,
         for page in ranked
     ]
     return _fit_representative_pages_to_budget(prepared, budget=_REPRESENTATIVE_PAGE_BUDGET)
+
+
+def _extract_head_signal_lines(soup: BeautifulSoup) -> list[str]:
+    lines: list[str] = []
+    if soup.title and soup.title.string:
+        title = re.sub(r"\s+", " ", str(soup.title.string or "")).strip()
+        if title:
+            lines.append(title)
+    for tag in soup.find_all("meta"):
+        key = str(tag.get("property") or tag.get("name") or "").strip().lower()
+        if key not in _META_HEAD_SIGNAL_NAMES:
+            continue
+        content = re.sub(r"\s+", " ", str(tag.get("content") or "")).strip()
+        if content and content not in lines:
+            lines.append(content)
+    return lines[:6]
 
 
 def _representative_page_priority(url: str, content: str) -> int:

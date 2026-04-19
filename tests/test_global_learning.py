@@ -40,6 +40,16 @@ def test_extract_learning_tokens_skips_root_family_feature() -> None:
     assert "family:root" not in tokens
 
 
+def test_extract_learning_tokens_drops_person_name_tokens_for_profile_pages() -> None:
+    tokens = extract_learning_tokens("https://example.com/about-us/our-people/david-esfandi")
+
+    assert "about" in tokens
+    assert "people" in tokens
+    assert "family:about/people" in tokens
+    assert "david" not in tokens
+    assert "esfandi" not in tokens
+
+
 def test_global_learning_store_persists_scores_across_instances(tmp_path: Path) -> None:
     db_path = tmp_path / "global_learning.sqlite3"
     first = GlobalLearningStore(db_path)

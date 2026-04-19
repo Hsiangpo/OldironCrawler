@@ -25,6 +25,7 @@ from oldironcrawler.extractor.protocol_discovery import (
     is_supported_url as _is_supported_url,
     merge_unique_urls as _merge_unique_urls,
     pick_subdomain_probe_urls as _pick_subdomain_probe_urls,
+    prioritize_discovery_urls as _prioritize_discovery_urls,
 )
 
 _HREF_RE = re.compile(r'<a\s[^>]*href=["\']([^"\']+)["\']', re.IGNORECASE)
@@ -508,14 +509,15 @@ class SiteProtocolClient:
         locations = self._find_sitemap_locations(session, base_url)
         if not locations:
             locations = [urljoin(base_url, "/sitemap.xml")]
+        scan_limit = min(max(limit * 4, limit), 400)
         urls: list[str] = []
         visited: set[str] = set()
         base_host = (urlparse(base_url).netloc or "").strip().lower()
         for location in locations:
-            if len(urls) >= limit:
+            if len(urls) >= scan_limit:
                 break
-            self._parse_sitemap_recursive(session, location, urls, visited, base_host=base_host, limit=limit, depth=0)
-        return urls[:limit]
+            self._parse_sitemap_recursive(session, location, urls, visited, base_host=base_host, limit=scan_limit, depth=0)
+        return _prioritize_discovery_urls(base_url, urls, limit=limit)
 
     def _find_sitemap_locations(self, session: cffi_requests.Session, base_url: str) -> list[str]:
         robots_url = urljoin(base_url, "/robots.txt")
@@ -607,7 +609,7 @@ class SiteProtocolClient:
             homepage_error = exc
         guessed_urls = self._probe_common_value_urls(session, start_url, limit=limit)
         homepage_links = _extract_same_site_links(homepage_html, start_url, limit=limit) if homepage_html else []
-        merged = _merge_unique_urls(homepage_links, guessed_urls, limit=limit)
+        merged = _merge_unique_urls(guessed_urls, homepage_links, limit=limit)
         if homepage_html:
             return merged, homepage_html
         if guessed_urls:

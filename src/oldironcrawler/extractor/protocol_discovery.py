@@ -33,28 +33,114 @@ _TRACKING_QUERY_KEYS = {
     "srsltid",
 }
 _COMMON_VALUE_PATHS = (
-    "/about",
-    "/about-us",
-    "/about.html",
-    "/company",
-    "/company-leadership",
-    "/contact",
-    "/contact-us",
-    "/contact.html",
-    "/executive-team",
     "/impressum",
     "/imprint",
-    "/legal-notice",
-    "/our-team",
-    "/team",
-    "/team-members",
+    "/about-us/our-people",
+    "/our-people",
+    "/company-leadership",
+    "/executive-team",
     "/leadership",
     "/management",
+    "/our-team",
+    "/team-members",
+    "/team",
     "/people",
+    "/about-us",
+    "/about",
+    "/about.html",
+    "/company",
+    "/contact-us",
+    "/contact",
+    "/contact.html",
+    "/legal-notice",
     "/privacy-policy",
     "/privacy",
     "/terms",
 )
+_DISCOVERY_PRIORITY_PHRASES = (
+    ("/about-us/our-people/", 90),
+    ("/about-us/our-people", 88),
+    ("/our-people/", 86),
+    ("/our-people", 84),
+    ("/team-members/", 84),
+    ("/team-members", 82),
+    ("/impressum", 80),
+    ("/imprint", 80),
+    ("/company-leadership", 78),
+    ("/executive-team", 78),
+    ("/leadership", 74),
+    ("/management", 72),
+    ("/board", 70),
+    ("/governance", 70),
+    ("/officers", 68),
+    ("/about-us", 56),
+    ("/about", 44),
+    ("/contact-us", 32),
+    ("/contact", 24),
+)
+_DISCOVERY_PRIORITY_NEGATIVE_TOKENS = {
+    "article",
+    "articles",
+    "award",
+    "awards",
+    "blog",
+    "case",
+    "event",
+    "events",
+    "funds",
+    "insight",
+    "insights",
+    "journeys",
+    "news",
+    "post",
+    "posts",
+    "resource",
+    "resources",
+    "stories",
+    "story",
+    "update",
+    "updates",
+}
+_DISCOVERY_NAMED_DETAIL_CONTEXT_TOKENS = {
+    "about",
+    "leadership",
+    "management",
+    "officers",
+    "our",
+    "people",
+    "profile",
+    "profiles",
+    "referral",
+    "referrals",
+    "team",
+}
+_DISCOVERY_NAMED_DETAIL_STOP_TOKENS = _DISCOVERY_NAMED_DETAIL_CONTEXT_TOKENS | {
+    "business",
+    "careers",
+    "charitable",
+    "company",
+    "corporate",
+    "culture",
+    "cultures",
+    "director",
+    "directors",
+    "executive",
+    "foundation",
+    "fund",
+    "funds",
+    "group",
+    "investment",
+    "investments",
+    "legal",
+    "office",
+    "our",
+    "people",
+    "planning",
+    "responsibility",
+    "service",
+    "services",
+    "wealth",
+}
 
 
 def extract_same_site_links(html_text: str, page_url: str, *, limit: int) -> list[str]:
@@ -242,3 +328,66 @@ def extract_registrable_domain(value: str) -> str:
     if suffix2 in {"ac.jp", "co.jp", "go.jp", "ne.jp", "or.jp", "ac.uk", "co.uk", "gov.uk", "org.uk", "com.au", "net.au", "org.au", "com.br", "net.br", "org.br", "co.nz", "org.nz", "com.mx", "org.mx"} and len(labels) >= 3:
         return ".".join(labels[-3:])
     return suffix2
+
+
+def prioritize_discovery_urls(start_url: str, urls: list[str], *, limit: int) -> list[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for url in urls:
+        normalized = normalize_discovery_url(url)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append(normalized)
+    ranked = sorted(
+        enumerate(unique),
+        key=lambda item: (
+            -_discovery_priority_score(start_url, item[1]),
+            item[0],
+        ),
+    )
+    return [url for _index, url in ranked[:limit]]
+
+
+def _discovery_priority_score(start_url: str, url: str) -> int:
+    lowered = str(url or "").lower()
+    tokens = extract_url_hint_tokens(url)
+    score = 0
+    for phrase, value in _DISCOVERY_PRIORITY_PHRASES:
+        if phrase in lowered:
+            score += value
+    if _looks_like_named_detail_url(tokens):
+        score += 34
+    if _extract_locale_token(start_url) and _extract_locale_token(start_url) == _extract_locale_token(url):
+        score += 10
+    elif _extract_locale_token(start_url) and _extract_locale_token(url):
+        score -= 10
+    if any(token in _DISCOVERY_PRIORITY_NEGATIVE_TOKENS for token in tokens):
+        score -= 28
+    score -= min((urlparse(url).path or "").count("/"), 6)
+    return score
+
+
+def _looks_like_named_detail_url(tokens: list[str]) -> bool:
+    if len(tokens) < 3 or len(tokens) > 6:
+        return False
+    if not any(token in _DISCOVERY_NAMED_DETAIL_CONTEXT_TOKENS for token in tokens):
+        return False
+    name_tokens = [
+        token
+        for token in tokens
+        if token not in _DISCOVERY_NAMED_DETAIL_STOP_TOKENS and token not in _DISCOVERY_PRIORITY_NEGATIVE_TOKENS
+    ]
+    if len(name_tokens) < 2 or len(name_tokens) > 3:
+        return False
+    return all(token.isalpha() and len(token) >= 3 for token in name_tokens[:2])
+
+
+def _extract_locale_token(url: str) -> str:
+    path = str(urlparse(str(url or "")).path or "").strip("/")
+    if not path:
+        return ""
+    first = path.split("/", 1)[0].strip().lower()
+    if re.fullmatch(r"[a-z]{2}(?:-[a-z]{2})?", first):
+        return first
+    return ""

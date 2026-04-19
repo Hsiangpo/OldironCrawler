@@ -29,6 +29,14 @@ _GENERIC_COMPANY_PHRASES = (
     "terms and conditions",
     "cookie policy",
 )
+_INVALID_COMPANY_NAMES = {
+    "account suspended",
+}
+_TRADING_AS_RE = re.compile(r"(?i)\btrading as\b")
+_REGISTRATION_SUFFIX_RE = re.compile(
+    r"\b((?:limited|ltd|llp|plc|inc|corp|corporation|company|group|kg|gmbh))\b[\s,.:;-]*\d{6,}$",
+    re.IGNORECASE,
+)
 
 
 def extract_company_name_fallback(website: str, pages: list[tuple[str, str]]) -> str:
@@ -51,6 +59,22 @@ def extract_company_name_fallback(website: str, pages: list[tuple[str, str]]) ->
         seen.add(dedupe)
         return normalized
     return ""
+
+
+def clean_company_name_candidate(value: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", html.unescape(str(value or ""))).strip()
+    text = re.sub(r"\s+", " ", text)
+    if not text:
+        return ""
+    text = _clean_trading_as_text(text)
+    lowered = text.lower()
+    if lowered in _INVALID_COMPANY_NAMES:
+        return ""
+    text = _REGISTRATION_SUFFIX_RE.sub(r"\1", text).strip(" ,.-")
+    lowered = text.lower()
+    if lowered in _INVALID_COMPANY_NAMES:
+        return ""
+    return text
 
 
 def _extract_company_candidates_from_html(html_text: str, site_token: str, page_weight: int) -> list[tuple[int, str]]:
@@ -159,8 +183,7 @@ def _score_company_candidate(value: str, site_token: str, base_score: int) -> in
 
 
 def _normalize_company_text(value: str) -> str:
-    text = re.sub(r"<[^>]+>", " ", html.unescape(str(value or ""))).strip()
-    text = re.sub(r"\s+", " ", text)
+    text = clean_company_name_candidate(value)
     lowered = text.lower()
     for prefix in _GENERIC_PREFIXES:
         if lowered.startswith(prefix):
@@ -176,4 +199,16 @@ def _normalize_company_text(value: str) -> str:
         lowered = text.lower()
     if not text or lowered in _GENERIC_COMPANY_PHRASES:
         return ""
+    return text
+
+
+def _clean_trading_as_text(text: str) -> str:
+    match = re.search(r"\(\s*trading as\s+(.+?)\s*\)$", text, flags=re.IGNORECASE)
+    if match is not None:
+        return str(match.group(1) or "").strip(" ,.-")
+    parts = _TRADING_AS_RE.split(text, maxsplit=1)
+    if len(parts) == 2:
+        trailing = str(parts[1] or "").strip(" ,.-")
+        if trailing:
+            return trailing
     return text
