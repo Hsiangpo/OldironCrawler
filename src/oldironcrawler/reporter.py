@@ -38,11 +38,13 @@ def print_progress_heartbeat(*, total: int, done: int, running: int, dropped: in
 
 def write_delivery_csv(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+    temp_path = path.with_name(f"{path.name}.tmp")
+    with temp_path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=["company_name", "representative", "emails", "website"])
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
+    temp_path.replace(path)
 
 
 def _display(value: str) -> str:

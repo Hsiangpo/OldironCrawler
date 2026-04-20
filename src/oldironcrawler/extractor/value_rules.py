@@ -433,6 +433,10 @@ def merge_representative_urls(base_urls: list[str], learned_urls: list[str], *, 
     return urls
 
 
+def canonicalize_target_url(url: str) -> str:
+    return _canonical_target_url(url)
+
+
 def count_selected_families(candidates: list[UrlCandidate], urls: list[str]) -> int:
     candidate_map = {candidate.url: candidate for candidate in candidates}
     families = {

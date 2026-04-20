@@ -39,12 +39,19 @@ def test_app_config_loads_value_budget_defaults(tmp_path: Path, monkeypatch) -> 
     assert config.email_stop_same_domain_count == 2
 
 
-def test_app_config_supports_value_budget_env_override(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("REP_PAGE_LIMIT", "6")
-    monkeypatch.setenv("EMAIL_PAGE_SOFT_LIMIT", "9")
-    monkeypatch.setenv("EMAIL_PAGE_HARD_LIMIT", "18")
-    monkeypatch.setenv("PAGE_TOTAL_HARD_LIMIT", "22")
-    monkeypatch.setenv("EMAIL_STOP_SAME_DOMAIN_COUNT", "3")
+def test_app_config_supports_value_budget_dotenv_override(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "REP_PAGE_LIMIT=6",
+                "EMAIL_PAGE_SOFT_LIMIT=9",
+                "EMAIL_PAGE_HARD_LIMIT=18",
+                "PAGE_TOTAL_HARD_LIMIT=22",
+                "EMAIL_STOP_SAME_DOMAIN_COUNT=3",
+            ]
+        ),
+        encoding="utf-8",
+    )
 
     config = AppConfig.load(tmp_path)
 

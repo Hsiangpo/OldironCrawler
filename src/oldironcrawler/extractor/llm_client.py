@@ -15,6 +15,8 @@ from bs4 import BeautifulSoup
 from markdownify import MarkdownConverter
 from openai import OpenAI
 
+from oldironcrawler.llm_errors import LlmIntervention, classify_llm_exception
+
 
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 _DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
@@ -80,7 +82,15 @@ class LlmExtractionResult:
 
 
 class LlmConfigurationError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, failure: LlmIntervention | None = None) -> None:
+        super().__init__(message)
+        self.failure = failure
+
+
+class LlmTemporaryError(RuntimeError):
+    def __init__(self, message: str, *, failure: LlmIntervention | None = None) -> None:
+        super().__init__(message)
+        self.failure = failure
 
 
 class WebsiteLlmClient:
@@ -139,6 +149,28 @@ class WebsiteLlmClient:
 
     def ping(self) -> None:
         self._call_json('只返回 JSON：{"ok":true}')
+
+    def pick_website_column(
+        self,
+        *,
+        source_name: str,
+        columns: list[dict[str, Any]],
+        deadline_monotonic: float | None = None,
+    ) -> dict[str, Any]:
+        prompt = (
+            "你是表格网站列识别器。\n"
+            "目标：在一个网站导入表里，找出真正代表公司官网主站的那一列。\n"
+            "强规则：\n"
+            "1. 只能选择一个列 index。\n"
+            "2. 优先公司官网主站、主页、domain、company website、official website。\n"
+            "3. 明确排除 linkedin/facebook/instagram/twitter/youtube/tiktok 等社媒列。\n"
+            "4. 明确排除 email、phone、address、notes、comments 这类列。\n"
+            "5. 如果有多个 URL 类列，优先公司官网，不要选社媒、客服工单、招聘平台、地图页。\n"
+            '返回 JSON：{"selected_index":0,"confidence":"high|medium|low","reason":""}\n\n'
+            f"文件名: {source_name}\n"
+            f"列摘要(JSON): {json.dumps(columns, ensure_ascii=False)}"
+        )
+        return self._call_json(prompt, deadline_monotonic=deadline_monotonic)
 
     def pick_representative_urls(
         self,
@@ -303,23 +335,28 @@ class WebsiteLlmClient:
                     max_retries=max_retries,
                 )
             except Exception as exc:  # noqa: BLE001
+                failure = classify_llm_exception(exc)
+                if failure is not None:
+                    if failure.prompt_mode == "new_key":
+                        raise LlmConfigurationError(failure.user_message, failure=failure) from exc
+                    transient_attempt += 1
+                    if transient_attempt >= max_retries:
+                        raise LlmTemporaryError(failure.user_message, failure=failure) from exc
+                    _sleep_for_llm_failure(failure, transient_attempt, deadline_monotonic=deadline_monotonic)
+                    continue
                 error_text = str(exc)
-                lowered = error_text.lower()
-                if any(token in lowered for token in ("budget_exhausted", "insufficient_quota", "invalid_api_key", "authentication", "401")):
-                    raise LlmConfigurationError(error_text) from exc
-                if any(token in error_text for token in ("429", "rate_limit", "Rate limit")):
-                    transient_attempt += 1
-                    if transient_attempt >= max_retries:
-                        raise
-                    _sleep_with_jitter(5.0, 1.5, deadline_monotonic=deadline_monotonic)
-                    continue
-                if any(token in error_text for token in ("500", "502", "503", "504", "overloaded", "capacity", "upstream")):
-                    transient_attempt += 1
-                    if transient_attempt >= max_retries:
-                        raise
-                    _sleep_with_jitter(min(30 + transient_attempt * 5, 60), 4.0, deadline_monotonic=deadline_monotonic)
-                    continue
-                if any(token in error_text.lower() for token in ("timeout", "timed out", "connection", "remoteprotocolerror", "server disconnected", "unexpected_eof_while_reading", "eof occurred in violation of protocol")):
+                if any(
+                    token in error_text.lower()
+                    for token in (
+                        "timeout",
+                        "timed out",
+                        "connection",
+                        "remoteprotocolerror",
+                        "server disconnected",
+                        "unexpected_eof_while_reading",
+                        "eof occurred in violation of protocol",
+                    )
+                ):
                     transient_attempt += 1
                     if transient_attempt >= max_retries:
                         raise
@@ -347,20 +384,31 @@ class WebsiteLlmClient:
                 response = self._client.chat.completions.create(**chat_kwargs, timeout=request_timeout)
                 return _extract_chat_text(response)
             except Exception as exc:  # noqa: BLE001
-                error_text = str(exc)
-                lowered = error_text.lower()
-                if any(token in lowered for token in ("budget_exhausted", "insufficient_quota", "invalid_api_key", "authentication", "401")):
-                    raise LlmConfigurationError(error_text) from exc
+                failure = classify_llm_exception(exc)
+                if failure is not None:
+                    if failure.prompt_mode == "new_key":
+                        raise LlmConfigurationError(failure.user_message, failure=failure) from exc
+                    transient_attempt += 1
+                    if transient_attempt >= max_retries:
+                        raise LlmTemporaryError(failure.user_message, failure=failure) from exc
+                    _sleep_for_llm_failure(failure, transient_attempt, deadline_monotonic=deadline_monotonic)
+                    continue
+                error_text = str(exc).lower()
                 transient_attempt += 1
                 if transient_attempt >= max_retries:
                     raise
-                if any(token in lowered for token in ("429", "rate_limit", "rate limit")):
-                    _sleep_with_jitter(5.0, 1.5, deadline_monotonic=deadline_monotonic)
-                    continue
-                if any(token in lowered for token in ("500", "502", "503", "504", "overloaded", "capacity", "upstream")):
-                    _sleep_with_jitter(min(30 + transient_attempt * 5, 60), 4.0, deadline_monotonic=deadline_monotonic)
-                    continue
-                if any(token in lowered for token in ("timeout", "timed out", "connection", "remoteprotocolerror", "server disconnected", "unexpected_eof_while_reading", "eof occurred in violation of protocol")):
+                if any(
+                    token in error_text
+                    for token in (
+                        "timeout",
+                        "timed out",
+                        "connection",
+                        "remoteprotocolerror",
+                        "server disconnected",
+                        "unexpected_eof_while_reading",
+                        "eof occurred in violation of protocol",
+                    )
+                ):
                     _sleep_with_jitter(min(2 ** transient_attempt, 8), 1.0, deadline_monotonic=deadline_monotonic)
                     continue
                 raise
@@ -451,6 +499,29 @@ def _sleep_with_jitter(
         sleep_seconds = min(sleep_seconds, max(remaining, 0.0))
     if sleep_seconds > 0:
         time.sleep(sleep_seconds)
+
+
+def _sleep_for_llm_failure(
+    failure: LlmIntervention,
+    transient_attempt: int,
+    *,
+    deadline_monotonic: float | None = None,
+) -> None:
+    if failure.retry_after_seconds is not None:
+        _sleep_with_jitter(
+            float(failure.retry_after_seconds),
+            0.5,
+            deadline_monotonic=deadline_monotonic,
+        )
+        return
+    if failure.status_code == 429:
+        _sleep_with_jitter(5.0, 1.5, deadline_monotonic=deadline_monotonic)
+        return
+    _sleep_with_jitter(
+        min(30 + transient_attempt * 5, 60),
+        4.0,
+        deadline_monotonic=deadline_monotonic,
+    )
 
 
 def _bounded_deadline_timeout(base_timeout: float, deadline_monotonic: float | None) -> float:

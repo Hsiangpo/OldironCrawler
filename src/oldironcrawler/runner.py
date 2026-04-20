@@ -4,7 +4,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 
 from oldironcrawler.config import AppConfig
-from oldironcrawler.extractor.llm_client import LlmConfigurationError, WebsiteLlmClient
+from oldironcrawler.extractor.llm_client import LlmConfigurationError, LlmTemporaryError, WebsiteLlmClient
 from oldironcrawler.extractor.page_pool import PageFetchPool, PageFetchPoolConfig
 from oldironcrawler.extractor.protocol_client import ProtocolPermanentError, ProtocolTemporaryError
 from oldironcrawler.extractor.service import SiteProfileService
@@ -14,8 +14,9 @@ from oldironcrawler.runtime.store import RuntimeStore, SiteTask
 
 
 def run_crawl_session(config: AppConfig, store: RuntimeStore, delivery_path) -> None:
-    total = store.progress()["total"]
-    completed_count = 0
+    progress = store.progress()
+    total = progress["total"]
+    completed_count = _count_completed_sites(progress)
     heartbeat_seconds = 10.0
     llm_client = WebsiteLlmClient(
         api_key=config.llm_key,
@@ -56,19 +57,36 @@ def run_crawl_session(config: AppConfig, store: RuntimeStore, delivery_path) -> 
                         pending=progress["pending"] + progress["failed_temp"],
                     )
                     continue
+                llm_error: LlmConfigurationError | None = None
                 for future in done:
                     task = futures.pop(future)
                     try:
-                        completed_count = _handle_future(future, task, total, completed_count, store, learning_store)
-                    except LlmConfigurationError:
-                        for pending_future in futures:
-                            pending_future.cancel()
-                        raise
+                        completed_count = _handle_future(
+                            future,
+                            task,
+                            total,
+                            completed_count,
+                            store,
+                            learning_store,
+                            delivery_path,
+                        )
+                    except LlmConfigurationError as exc:
+                        llm_error = llm_error or exc
+                if llm_error is not None:
+                    for pending_future in futures:
+                        pending_future.cancel()
+                    raise llm_error
     finally:
         page_pool.close()
         llm_client.close()
         learning_store.close()
     write_delivery_csv(delivery_path, store.delivery_rows())
+
+
+def _count_completed_sites(progress: dict[str, int]) -> int:
+    done = int(progress.get("done", 0) or 0)
+    dropped = int(progress.get("dropped", 0) or 0)
+    return done + dropped
 
 
 def _run_single_site(
@@ -85,6 +103,8 @@ def _run_single_site(
         return service.process(task.id, task.website, deadline_monotonic=deadline)
     except LlmConfigurationError:
         raise
+    except LlmTemporaryError:
+        raise
     except ProtocolTemporaryError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -100,15 +120,34 @@ def _handle_future(
     completed_count: int,
     store: RuntimeStore,
     learning_store: GlobalLearningStore,
+    delivery_path,
 ) -> int:
     try:
         processed = future.result()
     except LlmConfigurationError:
         raise
+    except LlmTemporaryError as exc:
+        status = store.mark_failed(task.id, str(exc))
+        if status == "dropped":
+            stage_metrics = store.load_stage_metrics(task.id)
+            completed_count += 1
+            _flush_delivery_snapshot(delivery_path, store)
+            print_site_result(
+                completed_index=completed_count,
+                total=total,
+                website=task.website,
+                company_name="",
+                representative="",
+                emails="",
+                reason=_describe_error_reason(str(exc)),
+                stage_metrics=stage_metrics,
+            )
+        return completed_count
     except ProtocolPermanentError as exc:
         store.mark_dropped(task.id, str(exc))
         stage_metrics = store.load_stage_metrics(task.id)
         completed_count += 1
+        _flush_delivery_snapshot(delivery_path, store)
         print_site_result(
             completed_index=completed_count,
             total=total,
@@ -125,6 +164,7 @@ def _handle_future(
         if status == "dropped":
             stage_metrics = store.load_stage_metrics(task.id)
             completed_count += 1
+            _flush_delivery_snapshot(delivery_path, store)
             print_site_result(
                 completed_index=completed_count,
                 total=total,
@@ -141,6 +181,7 @@ def _handle_future(
         if status == "dropped":
             stage_metrics = store.load_stage_metrics(task.id)
             completed_count += 1
+            _flush_delivery_snapshot(delivery_path, store)
             print_site_result(
                 completed_index=completed_count,
                 total=total,
@@ -155,6 +196,7 @@ def _handle_future(
     store.mark_done(task.id, processed.result)
     _apply_learning_feedback(learning_store, processed.learning_feedback)
     completed_count += 1
+    _flush_delivery_snapshot(delivery_path, store)
     print_site_result(
         completed_index=completed_count,
         total=total,
@@ -166,6 +208,13 @@ def _handle_future(
         stage_metrics=processed.stage_metrics,
     )
     return completed_count
+
+
+def _flush_delivery_snapshot(delivery_path, store: RuntimeStore) -> None:
+    try:
+        write_delivery_csv(delivery_path, store.delivery_rows())
+    except OSError as exc:
+        print(f"写入交付文件失败：{exc}", flush=True)
 
 
 def _apply_learning_feedback(learning_store: GlobalLearningStore, feedback) -> None:
@@ -246,10 +295,14 @@ def _describe_error_reason(error_text: str) -> str:
         return "本地高并发 DNS 解析资源不足，当前请求未成功"
     if "resource temporarily unavailable" in lowered or "[errno 35]" in lowered:
         return "本地高并发网络资源暂时不足，当前请求未成功"
+    if "request_slot_timeout" in lowered:
+        return "本地协议请求并发已打满，当前请求未成功"
     if any(token in lowered for token in ("failed to connect", "couldn't connect to server", "connection refused", "no route to host", "network is unreachable", "host is down")):
         return "站点当前明显无法连通，已直接停止重试"
     if "timed out" in lowered or "timeout" in lowered:
         return "请求超时"
+    if "service_temporarily_unavailable" in lowered or "llm 服务暂时不可用" in lowered:
+        return "LLM 服务暂时不可用"
     if "tls connect error" in lowered or "tlsv1_alert" in lowered:
         return "站点 TLS 握手失败"
     if "site_deadline_exceeded" in lowered:

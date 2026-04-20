@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import gzip
 import html
-import os
 import re
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from contextlib import contextmanager
+from concurrent.futures import FIRST_COMPLETED, Future, wait
 from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlparse
 from xml.etree import ElementTree
@@ -17,6 +15,7 @@ from curl_cffi import requests as cffi_requests
 
 from oldironcrawler.challenge_solver import resolve_cloudflare_challenge
 from oldironcrawler.extractor.page_pool import PageFetchPool
+from oldironcrawler.extractor.protocol_runtime import configure_protocol_runtime, get_probe_executor, request_slot
 from oldironcrawler.extractor.protocol_discovery import (
     build_common_probe_urls as _build_common_probe_urls,
     extract_registrable_domain as _extract_registrable_domain,
@@ -59,6 +58,7 @@ _TEMP_ERROR_HINTS = (
     "failed to create thread",
     "resource temporarily unavailable",
     "[errno 35]",
+    "request_slot_timeout",
 )
 _PERMANENT_ERROR_HINTS = (
     "could not resolve host",
@@ -90,8 +90,6 @@ _INCAPSULA_CHALLENGE_HINTS = (
     "imperva",
 )
 _NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-_REQUEST_SLOT_LIMIT = max(int(os.getenv("PROTOCOL_REQUEST_SLOTS", "52") or "52"), 1)
-_REQUEST_SLOT_SEMAPHORE = threading.BoundedSemaphore(_REQUEST_SLOT_LIMIT)
 _SITE_DEADLINE_SAFETY_SECONDS = 8.0
 class ProtocolTemporaryError(RuntimeError):
     pass
@@ -125,10 +123,11 @@ class SiteProtocolConfig:
     page_batch_timeout_seconds: float = 45.0
     deadline_monotonic: float | None = None
     common_probe_target: int = 8
-    common_probe_concurrency: int = 52
+    common_probe_concurrency: int = 8
     common_probe_patience_batches: int = 2
     common_probe_min_hits_after_patience: int = 2
     related_seed_limit: int = 2
+    request_slot_limit: int = 8
     default_headers: dict[str, str] = field(default_factory=lambda: {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
@@ -136,8 +135,11 @@ class SiteProtocolConfig:
 class SiteProtocolClient:
     def __init__(self, config: SiteProtocolConfig) -> None:
         self._config = config
+        configure_protocol_runtime(
+            probe_workers=max(config.common_probe_concurrency, 1),
+            request_slots=max(config.request_slot_limit, 1),
+        )
         self._http_client = self._build_httpx_client()
-        self._probe_executor = ThreadPoolExecutor(max_workers=max(config.common_probe_concurrency, 1))
         self._session_lock = threading.Lock()
         self._thread_sessions: dict[int, cffi_requests.Session] = {}
 
@@ -150,10 +152,6 @@ class SiteProtocolClient:
                 session.close()
             except Exception:  # noqa: BLE001
                 pass
-        try:
-            self._probe_executor.shutdown(wait=False, cancel_futures=True)
-        except Exception:  # noqa: BLE001
-            pass
         try:
             self._http_client.close()
         except Exception:  # noqa: BLE001
@@ -279,7 +277,7 @@ class SiteProtocolClient:
             response = None
             try:
                 request_timeout = self._resolve_timeout(timeout_seconds)
-                with _request_slot(timeout_seconds=request_timeout):
+                with request_slot(timeout_seconds=request_timeout):
                     response = session.get(url, timeout=request_timeout)
                 status = int(response.status_code)
                 if status == 200:
@@ -390,7 +388,7 @@ class SiteProtocolClient:
         response = None
         try:
             request_timeout = self._resolve_timeout(timeout_seconds)
-            with _request_slot(timeout_seconds=request_timeout):
+            with request_slot(timeout_seconds=request_timeout):
                 response = session.get(url, timeout=request_timeout)
             if int(response.status_code) != 200:
                 return ""
@@ -412,7 +410,7 @@ class SiteProtocolClient:
             return None
         try:
             request_timeout = self._resolve_timeout()
-            with _request_slot(timeout_seconds=request_timeout):
+            with request_slot(timeout_seconds=request_timeout):
                 response = self._http_client.get(url, timeout=request_timeout)
             if int(response.status_code) != 200:
                 return None
@@ -440,7 +438,7 @@ class SiteProtocolClient:
             client_kwargs["proxy"] = self._config.proxy_url
         try:
             with httpx.Client(**client_kwargs) as client:
-                with _request_slot(timeout_seconds=request_timeout):
+                with request_slot(timeout_seconds=request_timeout):
                     response = client.get(url, timeout=request_timeout)
                 if int(response.status_code) != 200:
                     return None
@@ -460,7 +458,7 @@ class SiteProtocolClient:
         response = None
         try:
             request_timeout = self._resolve_timeout()
-            with _request_slot(timeout_seconds=request_timeout):
+            with request_slot(timeout_seconds=request_timeout):
                 response = session.get(fallback_url, timeout=request_timeout)
             if int(response.status_code) != 200:
                 return None
@@ -486,7 +484,7 @@ class SiteProtocolClient:
         response = None
         try:
             request_timeout = self._resolve_timeout()
-            with _request_slot(timeout_seconds=request_timeout):
+            with request_slot(timeout_seconds=request_timeout):
                 response = session.get(fallback_url, timeout=request_timeout)
             if int(response.status_code) != 200:
                 return None
@@ -523,7 +521,7 @@ class SiteProtocolClient:
         robots_url = urljoin(base_url, "/robots.txt")
         try:
             request_timeout = self._resolve_timeout()
-            with _request_slot(timeout_seconds=request_timeout):
+            with request_slot(timeout_seconds=request_timeout):
                 response = session.get(robots_url, timeout=request_timeout)
             if int(response.status_code) != 200:
                 return []
@@ -661,7 +659,7 @@ class SiteProtocolClient:
         results: list[str] = []
         wait_deadline = time.monotonic() + self._resolve_timeout()
         for probe_url in probe_urls:
-            futures[self._probe_executor.submit(self._probe_common_value_url, probe_url)] = probe_url
+            futures[get_probe_executor().submit(self._probe_common_value_url, probe_url)] = probe_url
         while futures:
             remaining = wait_deadline - time.monotonic()
             if remaining <= 0:
@@ -753,7 +751,7 @@ class SiteProtocolClient:
     def _fetch_sitemap_text(self, session: cffi_requests.Session, url: str) -> str:
         try:
             request_timeout = self._resolve_timeout()
-            with _request_slot(timeout_seconds=request_timeout):
+            with request_slot(timeout_seconds=request_timeout):
                 response = session.get(url, timeout=request_timeout)
             if int(response.status_code) != 200:
                 return ""
@@ -937,17 +935,6 @@ def _detect_challenge_kind(html_text: str) -> str:
     if any(hint in lowered for hint in _INCAPSULA_CHALLENGE_HINTS):
         return "imperva_challenge"
     return ""
-
-@contextmanager
-def _request_slot(*, timeout_seconds: float | None = None):
-    wait_timeout = None if timeout_seconds is None else max(timeout_seconds, 0.01)
-    acquired = _REQUEST_SLOT_SEMAPHORE.acquire(timeout=wait_timeout)
-    if not acquired:
-        raise ProtocolTemporaryError("request_slot_timeout")
-    try:
-        yield
-    finally:
-        _REQUEST_SLOT_SEMAPHORE.release()
 
 
 def _decode_response_text(response: object) -> str:

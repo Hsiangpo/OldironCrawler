@@ -12,6 +12,7 @@ from oldironcrawler.extractor.protocol_client import HtmlPage, ProtocolPermanent
 from oldironcrawler.extractor.value_rules import (
     build_fetch_plan,
     build_candidates,
+    canonicalize_target_url,
     count_selected_families,
     extract_learning_tokens,
     merge_representative_urls,
@@ -94,23 +95,7 @@ class SiteProfileService:
         metrics = SiteStageMetrics()
         rep_learned = self._learning_store.load_scores("representative")
         email_learned = self._learning_store.load_scores("email")
-        protocol = SiteProtocolClient(
-            SiteProtocolConfig(
-                timeout_seconds=self._config.request_timeout_seconds,
-                proxy_url=self._config.proxy_url,
-                capsolver_api_key=self._config.capsolver_api_key,
-                capsolver_api_base_url=self._config.capsolver_api_base_url,
-                capsolver_proxy=self._config.capsolver_proxy,
-                capsolver_poll_seconds=self._config.capsolver_poll_seconds,
-                capsolver_max_wait_seconds=self._config.capsolver_max_wait_seconds,
-                cloudflare_proxy_url=self._config.cloudflare_proxy_url,
-                deadline_monotonic=deadline_monotonic,
-                page_batch_timeout_seconds=max(
-                    getattr(self._config, "total_wait_seconds", self._config.request_timeout_seconds * 2),
-                    self._config.request_timeout_seconds * 2,
-                ),
-            )
-        )
+        protocol = SiteProtocolClient(_build_site_protocol_config(self._config, deadline_monotonic))
         try:
             discovery = self._time_call(
                 metrics,
@@ -309,6 +294,26 @@ def _merge_page_targets(rep_urls: list[str], email_urls: list[str]) -> list[str]
             seen.add(url)
             result.append(url)
     return result
+
+
+def _build_site_protocol_config(config: AppConfig, deadline_monotonic: float | None) -> SiteProtocolConfig:
+    return SiteProtocolConfig(
+        timeout_seconds=config.request_timeout_seconds,
+        proxy_url=config.proxy_url,
+        capsolver_api_key=config.capsolver_api_key,
+        capsolver_api_base_url=config.capsolver_api_base_url,
+        capsolver_proxy=config.capsolver_proxy,
+        capsolver_poll_seconds=config.capsolver_poll_seconds,
+        capsolver_max_wait_seconds=config.capsolver_max_wait_seconds,
+        cloudflare_proxy_url=config.cloudflare_proxy_url,
+        deadline_monotonic=deadline_monotonic,
+        page_batch_timeout_seconds=max(
+            getattr(config, "total_wait_seconds", config.request_timeout_seconds * 2),
+            config.request_timeout_seconds * 2,
+        ),
+        common_probe_concurrency=max(int(config.page_concurrency or 1), 1),
+        request_slot_limit=max(int(config.page_concurrency or 1), 1),
+    )
 
 
 def _discover_value_snapshot(
@@ -608,11 +613,7 @@ def _collect_failed_rep_negative_tokens(
     positive_tokens: list[str],
     rep_fetched_urls: list[str],
 ) -> list[str]:
-    if positive_tokens:
-        return []
-    if representative or evidence_url:
-        return []
-    return _merge_learning_tokens(rep_fetched_urls)
+    return []
 
 
 def _collect_failed_email_negative_tokens(
@@ -620,11 +621,7 @@ def _collect_failed_email_negative_tokens(
     positive_tokens: list[str],
     email_fetched_urls: list[str],
 ) -> list[str]:
-    if positive_tokens:
-        return []
-    if emails:
-        return []
-    return _merge_learning_tokens(email_fetched_urls)
+    return []
 
 
 def _collect_positive_rep_tokens(representative: str, evidence_url: str, rep_fetched_urls: list[str]) -> list[str]:
@@ -659,10 +656,13 @@ def _extract_with_llm_or_empty(
 
 
 def _normalize_llm_result(llm_result: LlmExtractionResult, rep_pages: list) -> LlmExtractionResult:
-    available_urls = {page.url for page in rep_pages}
-    evidence_url = str(llm_result.evidence_url or "").strip()
-    if evidence_url and evidence_url not in available_urls:
-        evidence_url = ""
+    available_urls = {
+        canonicalize_target_url(page.url): page.url
+        for page in rep_pages
+        if str(page.url or "").strip()
+    }
+    raw_evidence_url = str(llm_result.evidence_url or "").strip()
+    evidence_url = available_urls.get(canonicalize_target_url(raw_evidence_url), "")
     representative = str(llm_result.representative or "").strip() if evidence_url else ""
     evidence_quote = str(llm_result.evidence_quote or "").strip() if representative else ""
     return LlmExtractionResult(

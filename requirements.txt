@@ -9,3 +9,4 @@ openai>=1.30
 openpyxl>=3.1
 python-dotenv>=1.0
 pytest>=8.0
+pyinstaller>=6.0

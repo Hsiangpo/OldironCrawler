@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import sys
 import time
-import resource
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
+from openpyxl import Workbook
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
@@ -18,17 +20,19 @@ from oldironcrawler.extractor.company_rules import extract_company_name_fallback
 from oldironcrawler.extractor.email_rules import collect_emails_for_pages
 from oldironcrawler.extractor import llm_client as llm_module
 from oldironcrawler.extractor import protocol_client as protocol_module
+from oldironcrawler.extractor import protocol_runtime as protocol_runtime_module
 from oldironcrawler.challenge_solver import CloudflareFallbackResult, CapSolverResult
-from oldironcrawler.extractor.llm_client import WebsiteLlmClient
+from oldironcrawler.extractor.llm_client import LlmConfigurationError, LlmExtractionResult, LlmTemporaryError, WebsiteLlmClient
 from oldironcrawler.extractor.page_pool import PageFetchPool, PageFetchPoolConfig
 from oldironcrawler.extractor.protocol_client import ProtocolPermanentError, ProtocolTemporaryError, SiteProtocolClient, SiteProtocolConfig
 from oldironcrawler.extractor.protocol_client import HtmlPage
 from oldironcrawler.extractor.umbraco_people import UmbracoBio, maybe_build_umbraco_people_page
-from oldironcrawler.extractor.service import _merge_page_targets
+from oldironcrawler.extractor.service import _build_site_protocol_config, _merge_page_targets, _normalize_llm_result
 from oldironcrawler.extractor.service import SiteProfileService
 from oldironcrawler.extractor.value_rules import build_candidates, extract_path_tokens, select_email_urls, select_representative_urls
 from oldironcrawler.importer import ImportedWebsite, choose_input_file, compute_rows_fingerprint, load_websites
 from oldironcrawler.runtime.global_learning import GlobalLearningStore
+from oldironcrawler import runner as runner_module
 from oldironcrawler.runner import _describe_error_reason, _describe_missing_reason, _looks_temporary_error
 from oldironcrawler.runtime.store import RuntimeStore, SiteResult, SiteStageMetrics
 
@@ -67,6 +71,79 @@ def test_choose_input_file_accepts_exact_filename(tmp_path: Path, monkeypatch) -
     chosen = choose_input_file(tmp_path)
 
     assert chosen == target
+
+
+def test_xlsx_loader_prefers_llm_selected_company_website_column(tmp_path: Path, capsys) -> None:
+    path = tmp_path / "mixed.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Company Name", "LinkedIn URL", "Email", "Company Website"])
+    ws.append(["Acme Ltd", "https://linkedin.com/company/acme", "info@acme.com", "https://acme.com"])
+    ws.append(["Beta Ltd", "https://linkedin.com/company/beta", "hello@beta.com", "beta.co.uk"])
+    wb.save(path)
+
+    def fake_picker(*, source_name: str, columns: list[dict[str, object]]):
+        assert source_name == "mixed.xlsx"
+        assert any(str(col.get("header") or "").strip().lower() == "company website" for col in columns)
+        return {"selected_index": 3, "confidence": "high", "reason": "该列看起来是公司官网主站"}
+
+    rows = load_websites(path, website_column_picker=fake_picker)
+    captured = capsys.readouterr()
+
+    assert [row.website for row in rows] == ["https://acme.com", "https://beta.co.uk"]
+    assert "自动识别网站列" in captured.out
+    assert "Company Website" in captured.out
+
+
+def test_xlsx_loader_rejects_social_column_even_if_picker_selects_it(tmp_path: Path) -> None:
+    path = tmp_path / "mixed.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Company Name", "LinkedIn URL", "Company URL"])
+    ws.append(["Acme Ltd", "https://linkedin.com/company/acme", "https://acme.com"])
+    ws.append(["Beta Ltd", "https://linkedin.com/company/beta", "https://beta.co.uk/about"])
+    wb.save(path)
+
+    rows = load_websites(
+        path,
+        website_column_picker=lambda **_kwargs: {
+            "selected_index": 1,
+            "confidence": "high",
+            "reason": "错误选择了社媒列",
+        },
+    )
+
+    assert [row.website for row in rows] == ["https://acme.com", "https://beta.co.uk/about"]
+
+
+def test_xlsx_loader_keeps_first_data_row_when_sheet_has_no_header(tmp_path: Path) -> None:
+    path = tmp_path / "headerless.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Acme Ltd", "USA", "acme.com"])
+    ws.append(["Beta Ltd", "UK", "beta.co.uk"])
+    wb.save(path)
+
+    rows = load_websites(path)
+
+    assert [row.website for row in rows] == ["https://acme.com", "https://beta.co.uk"]
+
+
+def test_xlsx_loader_reads_websites_from_non_active_sheet(tmp_path: Path) -> None:
+    path = tmp_path / "multi-sheet.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "说明"
+    ws.append(["备注", "这里没有网站"])
+    websites_ws = wb.create_sheet("网站表")
+    websites_ws.append(["Company Website"])
+    websites_ws.append(["https://acme.com"])
+    websites_ws.append(["beta.co.uk"])
+    wb.save(path)
+
+    rows = load_websites(path)
+
+    assert [row.website for row in rows] == ["https://acme.com", "https://beta.co.uk"]
 
 
 def test_rows_fingerprint_uses_normalized_rows() -> None:
@@ -187,6 +264,7 @@ def test_runtime_store_updates_and_loads_stage_metrics(tmp_path: Path) -> None:
 
 def test_raise_nofile_soft_limit_raises_soft_limit(monkeypatch) -> None:
     calls: list[tuple[int, tuple[int, int]]] = []
+    fake_resource = SimpleNamespace(RLIMIT_NOFILE=7, RLIM_INFINITY=-1)
 
     def fake_getrlimit(_kind: int):
         return (256, 1_000_000)
@@ -194,12 +272,13 @@ def test_raise_nofile_soft_limit_raises_soft_limit(monkeypatch) -> None:
     def fake_setrlimit(kind: int, value: tuple[int, int]) -> None:
         calls.append((kind, value))
 
-    monkeypatch.setattr("oldironcrawler.app.resource.getrlimit", fake_getrlimit)
-    monkeypatch.setattr("oldironcrawler.app.resource.setrlimit", fake_setrlimit)
+    fake_resource.getrlimit = fake_getrlimit
+    fake_resource.setrlimit = fake_setrlimit
+    monkeypatch.setattr("oldironcrawler.bootstrap._RESOURCE_MODULE", fake_resource)
 
     _raise_nofile_soft_limit(65536)
 
-    assert calls == [(resource.RLIMIT_NOFILE, (65536, 1_000_000))]
+    assert calls == [(fake_resource.RLIMIT_NOFILE, (65536, 1_000_000))]
 
 
 def test_page_fetch_pool_preserves_input_order() -> None:
@@ -750,6 +829,27 @@ def test_protocol_client_default_headers_allow_keepalive() -> None:
     assert "Connection" not in config.default_headers
 
 
+def test_build_site_protocol_config_uses_page_concurrency_for_probe_limits() -> None:
+    config = SimpleNamespace(
+        request_timeout_seconds=10.0,
+        proxy_url="",
+        capsolver_api_key="",
+        capsolver_api_base_url="https://api.capsolver.com",
+        capsolver_proxy="",
+        capsolver_poll_seconds=3.0,
+        capsolver_max_wait_seconds=40.0,
+        cloudflare_proxy_url="",
+        total_wait_seconds=180.0,
+        page_concurrency=7,
+    )
+
+    protocol_config = _build_site_protocol_config(config, 123.0)
+
+    assert protocol_config.common_probe_concurrency == 7
+    assert protocol_config.request_slot_limit == 7
+    assert protocol_config.deadline_monotonic == 123.0
+
+
 def test_merge_page_targets_dedupes_cross_pipeline_urls() -> None:
     merged = _merge_page_targets(
         ["https://example.com/about", "https://example.com/team"],
@@ -772,6 +872,313 @@ def test_llm_semaphore_updates_to_new_limit() -> None:
 
     assert llm_module._LLM_SEMAPHORE is not None
     assert llm_module._LLM_SEMAPHORE_LIMIT == 16
+
+
+def test_run_crawl_session_resume_keeps_completed_display_index(tmp_path: Path, monkeypatch) -> None:
+    displayed_indexes: list[int] = []
+
+    class ResumeStore:
+        def __init__(self) -> None:
+            self._claimed = False
+            self.marked_done: list[SiteResult] = []
+
+        def progress(self) -> dict[str, int]:
+            return {
+                "total": 100,
+                "done": 70,
+                "running": 0,
+                "dropped": 4,
+                "pending": 26,
+                "failed_temp": 0,
+            }
+
+        def claim_next_site(self):
+            if self._claimed:
+                return None
+            self._claimed = True
+            return SimpleNamespace(id=1, input_index=75, website="https://resume.example.com", dedupe_key="resume.example.com", retry_count=0)
+
+        def mark_done(self, site_id: int, result: SiteResult) -> None:
+            assert site_id == 1
+            self.marked_done.append(result)
+
+        def load_stage_metrics(self, site_id: int) -> SiteStageMetrics:
+            assert site_id == 1
+            return SiteStageMetrics()
+
+        def delivery_rows(self) -> list[dict[str, str]]:
+            return []
+
+    monkeypatch.setattr(
+        runner_module,
+        "_run_single_site",
+        lambda *args, **kwargs: SimpleNamespace(
+            result=SiteResult(
+                company_name="Resume Ltd",
+                representative="Alice Resume",
+                emails="alice@resume.example.com",
+                website="https://resume.example.com",
+            ),
+            learning_feedback=SimpleNamespace(
+                rep_positive_tokens=[],
+                rep_negative_tokens=[],
+                email_positive_tokens=[],
+                email_negative_tokens=[],
+            ),
+            stage_metrics=SiteStageMetrics(),
+        ),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "print_site_result",
+        lambda **kwargs: displayed_indexes.append(int(kwargs["completed_index"])),
+    )
+    monkeypatch.setattr(runner_module, "write_delivery_csv", lambda delivery_path, rows: None)
+
+    config = SimpleNamespace(
+        llm_key="test-key",
+        llm_base_url="https://example.com/v1",
+        llm_model="gpt-5.4-mini",
+        llm_api_style="responses",
+        llm_reasoning_effort="low",
+        proxy_url="",
+        request_timeout_seconds=10.0,
+        llm_concurrency=1,
+        page_worker_count=1,
+        page_host_limit=1,
+        runtime_dir=tmp_path,
+        site_concurrency=1,
+    )
+
+    runner_module.run_crawl_session(config, ResumeStore(), tmp_path / "resume.csv")
+
+    assert displayed_indexes == [75]
+
+
+def test_run_crawl_session_retries_temporary_llm_error_without_restarting_whole_job(tmp_path: Path, monkeypatch) -> None:
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    rows = [
+        ImportedWebsite(input_index=1, raw_website="a.com", website="https://a.com", dedupe_key="a.com"),
+    ]
+    store.prepare_job(input_name="sites.txt", fingerprint="abc", rows=rows)
+    attempts: list[int] = []
+    snapshots: list[list[dict[str, str]]] = []
+
+    def fake_run_single_site(_config, _store, _learning_store, _llm_client, _page_pool, task):
+        attempts.append(task.id)
+        if len(attempts) == 1:
+            raise LlmTemporaryError("503 service_temporarily_unavailable")
+        return SimpleNamespace(
+            result=SiteResult(
+                company_name="Retry Ltd",
+                representative="Alice Retry",
+                emails="retry@example.com",
+                website="https://a.com",
+            ),
+            learning_feedback=SimpleNamespace(
+                rep_positive_tokens=[],
+                rep_negative_tokens=[],
+                email_positive_tokens=[],
+                email_negative_tokens=[],
+            ),
+            stage_metrics=SiteStageMetrics(),
+        )
+
+    monkeypatch.setattr(runner_module, "_run_single_site", fake_run_single_site)
+    monkeypatch.setattr(runner_module, "print_site_result", lambda **_kwargs: None)
+    monkeypatch.setattr(runner_module, "print_progress_heartbeat", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        runner_module,
+        "WebsiteLlmClient",
+        lambda **_kwargs: SimpleNamespace(close=lambda: None),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "PageFetchPool",
+        lambda _config: SimpleNamespace(close=lambda: None),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "GlobalLearningStore",
+        lambda _path: SimpleNamespace(
+            close=lambda: None,
+            record_success=lambda *args, **kwargs: None,
+            record_failure=lambda *args, **kwargs: None,
+        ),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "write_delivery_csv",
+        lambda _delivery_path, rows: snapshots.append(list(rows)),
+    )
+
+    config = SimpleNamespace(
+        llm_key="test-key",
+        llm_base_url="https://example.com/v1",
+        llm_model="gpt-5.4-mini",
+        llm_api_style="responses",
+        llm_reasoning_effort="low",
+        proxy_url="",
+        request_timeout_seconds=10.0,
+        llm_concurrency=1,
+        page_worker_count=1,
+        page_host_limit=1,
+        runtime_dir=tmp_path,
+        site_concurrency=1,
+        total_wait_seconds=180.0,
+    )
+
+    runner_module.run_crawl_session(config, store, tmp_path / "delivery.csv")
+    progress = store.progress()
+
+    assert attempts == [1, 1]
+    assert progress["done"] == 1
+    assert any(snapshot and snapshot[0]["company_name"] == "Retry Ltd" for snapshot in snapshots)
+
+
+def test_run_crawl_session_persists_other_done_futures_before_raising_llm_error(tmp_path: Path, monkeypatch) -> None:
+    success_result = SimpleNamespace(
+        result=SiteResult(
+            company_name="Saved Ltd",
+            representative="Alice Saved",
+            emails="saved@example.com",
+            website="https://saved.example.com",
+        ),
+        learning_feedback=SimpleNamespace(
+            rep_positive_tokens=[],
+            rep_negative_tokens=[],
+            email_positive_tokens=[],
+            email_negative_tokens=[],
+        ),
+        stage_metrics=SiteStageMetrics(),
+    )
+
+    class FakeFuture:
+        def __init__(self, outcome) -> None:
+            self._outcome = outcome
+            self.cancelled = False
+
+        def result(self):
+            if isinstance(self._outcome, Exception):
+                raise self._outcome
+            return self._outcome
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    class FakeExecutor:
+        def __init__(self, futures: list[FakeFuture]) -> None:
+            self._futures = list(futures)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def submit(self, *_args, **_kwargs):
+            return self._futures.pop(0)
+
+    class FutureStore:
+        def __init__(self) -> None:
+            self._claim_count = 0
+            self.marked_done: list[int] = []
+
+        def progress(self) -> dict[str, int]:
+            return {
+                "total": 3,
+                "done": 0,
+                "running": 0,
+                "dropped": 0,
+                "pending": 3,
+                "failed_temp": 0,
+            }
+
+        def claim_next_site(self):
+            self._claim_count += 1
+            if self._claim_count == 1:
+                return SimpleNamespace(id=1, input_index=1, website="https://saved.example.com", dedupe_key="saved", retry_count=0)
+            if self._claim_count == 2:
+                return SimpleNamespace(id=2, input_index=2, website="https://retry.example.com", dedupe_key="retry", retry_count=0)
+            if self._claim_count == 3:
+                return SimpleNamespace(id=3, input_index=3, website="https://pending.example.com", dedupe_key="pending", retry_count=0)
+            return None
+
+        def mark_done(self, site_id: int, result: SiteResult) -> None:
+            assert result.company_name == "Saved Ltd"
+            self.marked_done.append(site_id)
+
+        def load_stage_metrics(self, _site_id: int) -> SiteStageMetrics:
+            return SiteStageMetrics()
+
+        def delivery_rows(self) -> list[dict[str, str]]:
+            return []
+
+    success_future = FakeFuture(success_result)
+    error_future = FakeFuture(LlmConfigurationError("invalid_api_key"))
+    pending_future = FakeFuture(success_result)
+    executor = FakeExecutor([success_future, error_future, pending_future])
+
+    monkeypatch.setattr(runner_module, "ThreadPoolExecutor", lambda max_workers: executor)
+    monkeypatch.setattr(runner_module, "wait", lambda keys, timeout, return_when: ([error_future, success_future], []))
+    monkeypatch.setattr(
+        runner_module,
+        "WebsiteLlmClient",
+        lambda **_kwargs: SimpleNamespace(close=lambda: None),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "PageFetchPool",
+        lambda _config: SimpleNamespace(close=lambda: None),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "GlobalLearningStore",
+        lambda _path: SimpleNamespace(
+            close=lambda: None,
+            record_success=lambda *args, **kwargs: None,
+            record_failure=lambda *args, **kwargs: None,
+        ),
+    )
+    monkeypatch.setattr(runner_module, "print_site_result", lambda **_kwargs: None)
+    monkeypatch.setattr(runner_module, "write_delivery_csv", lambda delivery_path, rows: None)
+
+    config = SimpleNamespace(
+        llm_key="test-key",
+        llm_base_url="https://example.com/v1",
+        llm_model="gpt-5.4-mini",
+        llm_api_style="responses",
+        llm_reasoning_effort="low",
+        proxy_url="",
+        request_timeout_seconds=10.0,
+        llm_concurrency=1,
+        page_worker_count=1,
+        page_host_limit=1,
+        runtime_dir=tmp_path,
+        site_concurrency=3,
+    )
+    store = FutureStore()
+
+    with pytest.raises(LlmConfigurationError):
+        runner_module.run_crawl_session(config, store, tmp_path / "resume.csv")
+
+    assert store.marked_done == [1]
+    assert pending_future.cancelled is True
+
+
+def test_normalize_llm_result_accepts_canonical_evidence_url() -> None:
+    result = _normalize_llm_result(
+        LlmExtractionResult(
+            company_name="Acme Ltd",
+            representative="Alice Example",
+            evidence_url="https://www.example.com/about/",
+            evidence_quote="Alice Example",
+        ),
+        [SimpleNamespace(url="https://example.com/about", html="<html></html>")],
+    )
+
+    assert result.representative == "Alice Example"
+    assert result.evidence_url == "https://example.com/about"
 
 
 def test_missing_reason_describes_empty_fields() -> None:
@@ -1097,11 +1504,14 @@ def test_protocol_discovery_probes_common_value_paths_when_homepage_is_blocked(m
     def fake_fetch_html(_session, url: str, *, required: bool, timeout_seconds=None, max_retries_override=None) -> str:
         if url == "https://example.com":
             raise ProtocolPermanentError("cloudflare_challenge: https://example.com")
-        if url == "https://example.com/contact-us":
-            return "<html>contact</html>"
         return ""
 
     monkeypatch.setattr(client, "_fetch_html", fake_fetch_html)
+    monkeypatch.setattr(
+        client,
+        "_probe_common_value_urls",
+        lambda *_args, **_kwargs: ["https://example.com/contact-us"],
+    )
     monkeypatch.setattr(client, "_discover_sitemap_urls", lambda *_args, **_kwargs: [])
 
     urls, homepage_html = client._discover_direct_urls(object(), "https://example.com", limit=20)
@@ -1600,10 +2010,11 @@ def test_maybe_build_umbraco_people_page_returns_none_without_people_page() -> N
 def test_request_slot_times_out_when_global_slots_are_exhausted(monkeypatch) -> None:
     semaphore = threading.BoundedSemaphore(1)
     assert semaphore.acquire(timeout=0.01) is True
-    monkeypatch.setattr(protocol_module, "_REQUEST_SLOT_SEMAPHORE", semaphore)
+    monkeypatch.setattr(protocol_runtime_module, "_REQUEST_SLOT_SEMAPHORE", semaphore)
+    monkeypatch.setattr(protocol_runtime_module, "_REQUEST_SLOT_LIMIT", 1)
 
     try:
-        with protocol_module._request_slot(timeout_seconds=0.01):
+        with protocol_runtime_module.request_slot(timeout_seconds=0.01):
             raise AssertionError("should not enter request slot")
-    except ProtocolTemporaryError as exc:
+    except RuntimeError as exc:
         assert "request_slot_timeout" in str(exc)

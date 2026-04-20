@@ -125,7 +125,7 @@ def test_build_learning_feedback_successful_representative_keeps_other_rep_pages
     assert feedback.rep_negative_tokens == []
 
 
-def test_build_learning_feedback_representative_failure_can_write_broad_negatives() -> None:
+def test_build_learning_feedback_representative_failure_stays_neutral() -> None:
     feedback = build_learning_feedback(
         representative="",
         evidence_url="",
@@ -143,8 +143,7 @@ def test_build_learning_feedback_representative_failure_can_write_broad_negative
         email_fetched_urls=[],
     )
 
-    assert "about" in feedback.rep_negative_tokens
-    assert "team" in feedback.rep_negative_tokens
+    assert feedback.rep_negative_tokens == []
     assert feedback.rep_positive_tokens == []
 
 
@@ -172,7 +171,7 @@ def test_build_learning_feedback_successful_email_keeps_other_email_pages_neutra
     assert feedback.email_negative_tokens == []
 
 
-def test_build_learning_feedback_email_failure_can_write_broad_negatives() -> None:
+def test_build_learning_feedback_email_failure_stays_neutral() -> None:
     feedback = build_learning_feedback(
         representative="",
         evidence_url="",
@@ -190,8 +189,7 @@ def test_build_learning_feedback_email_failure_can_write_broad_negatives() -> No
         ],
     )
 
-    assert "contact" in feedback.email_negative_tokens
-    assert "privacy" in feedback.email_negative_tokens
+    assert feedback.email_negative_tokens == []
     assert feedback.email_positive_tokens == []
 
 
