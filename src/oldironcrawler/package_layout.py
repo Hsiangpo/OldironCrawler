@@ -8,6 +8,11 @@ _PACKAGED_ALLOWED_KEYS = {
     "LLM_MODEL",
     "LLM_REASONING_EFFORT",
     "LLM_API_STYLE",
+    "CAPSOLVER_API_KEY",
+    "CAPSOLVER_API_BASE_URL",
+    "CAPSOLVER_PROXY",
+    "CLOUDFLARE_PROXY_URL",
+    "PROXY_URL",
     "LLM_CONCURRENCY",
     "SITE_CONCURRENCY",
     "PAGE_CONCURRENCY",
@@ -21,13 +26,7 @@ _PACKAGED_ALLOWED_KEYS = {
     "REQUEST_TIMEOUT_SECONDS",
     "TOTAL_WAIT_SECONDS",
 }
-_PACKAGED_OVERRIDES = {
-    "LLM_CONCURRENCY": "32",
-    "SITE_CONCURRENCY": "32",
-    "PAGE_CONCURRENCY": "32",
-    "PAGE_WORKER_COUNT": "32",
-    "PAGE_HOST_LIMIT": "32",
-}
+_PACKAGED_OVERRIDES: dict[str, str] = {}
 
 
 def build_portable_dist_folder(*, repo_root: Path, built_exe_path: Path) -> Path:

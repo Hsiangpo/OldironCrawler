@@ -29,8 +29,15 @@ _GENERIC_COMPANY_PHRASES = (
     "terms and conditions",
     "cookie policy",
 )
+_INVALID_COMPANY_PREFIXES = (
+    "access denied",
+    "hold tight",
+    "index of ",
+    "just a moment",
+)
 _INVALID_COMPANY_NAMES = {
     "account suspended",
+    "local index",
 }
 _TRADING_AS_RE = re.compile(r"(?i)\btrading as\b")
 _REGISTRATION_SUFFIX_RE = re.compile(
@@ -68,11 +75,11 @@ def clean_company_name_candidate(value: str) -> str:
         return ""
     text = _clean_trading_as_text(text)
     lowered = text.lower()
-    if lowered in _INVALID_COMPANY_NAMES:
+    if lowered in _INVALID_COMPANY_NAMES or any(lowered.startswith(prefix) for prefix in _INVALID_COMPANY_PREFIXES):
         return ""
     text = _REGISTRATION_SUFFIX_RE.sub(r"\1", text).strip(" ,.-")
     lowered = text.lower()
-    if lowered in _INVALID_COMPANY_NAMES:
+    if lowered in _INVALID_COMPANY_NAMES or any(lowered.startswith(prefix) for prefix in _INVALID_COMPANY_PREFIXES):
         return ""
     return text
 
@@ -88,7 +95,7 @@ def _extract_company_candidates_from_html(html_text: str, site_token: str, page_
     if title_match:
         candidates.append((_score_company_candidate(title_match.group(1), site_token, 10 + page_weight), title_match.group(1)))
     h1_match = _H1_RE.search(text)
-    if h1_match:
+    if h1_match and not str(h1_match.group(1) or "").strip().lower().startswith("recovered shell evidence for "):
         candidates.append((_score_company_candidate(h1_match.group(1), site_token, 14 + page_weight), h1_match.group(1)))
     return candidates
 

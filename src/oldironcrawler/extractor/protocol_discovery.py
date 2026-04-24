@@ -32,9 +32,23 @@ _TRACKING_QUERY_KEYS = {
     "ref_src",
     "srsltid",
 }
+_UNSUPPORTED_PATH_FRAGMENTS = (
+    "/.well-known/sgcaptcha",
+    "/cdn-cgi/",
+    "/wp-admin/",
+    "/wp-login.php",
+    "/xmlrpc.php",
+)
+_UNSUPPORTED_QUERY_PAIRS = (
+    ("action", "lostpassword"),
+)
 _COMMON_VALUE_PATHS = (
     "/impressum",
     "/imprint",
+    "/kontakt",
+    "/kontakt.html",
+    "/ueber-uns",
+    "/uber-uns",
     "/about-us/our-people",
     "/our-people",
     "/company-leadership",
@@ -66,6 +80,9 @@ _DISCOVERY_PRIORITY_PHRASES = (
     ("/team-members", 82),
     ("/impressum", 80),
     ("/imprint", 80),
+    ("/kontakt", 76),
+    ("/ueber-uns", 60),
+    ("/uber-uns", 58),
     ("/company-leadership", 78),
     ("/executive-team", 78),
     ("/leadership", 74),
@@ -199,7 +216,13 @@ def is_supported_url(url: str) -> bool:
     lowered = text.lower()
     if "{" in text or "}" in text or "itemdataobject." in lowered:
         return False
-    path = (urlparse(text).path or "").lower()
+    parsed = urlparse(text)
+    path = str(parsed.path or "").lower()
+    query = str(parsed.query or "").lower()
+    if any(fragment in path for fragment in _UNSUPPORTED_PATH_FRAGMENTS):
+        return False
+    if any(f"{key}={value}" in query for key, value in _UNSUPPORTED_QUERY_PAIRS):
+        return False
     return not any(path.endswith(suffix) for suffix in _SKIP_EXTENSIONS)
 
 

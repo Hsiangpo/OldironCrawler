@@ -8,7 +8,9 @@ from oldironcrawler.extractor.company_rules import clean_company_name_candidate,
 from oldironcrawler.extractor.email_rules import analyze_email_set, collect_emails_for_pages, join_emails
 from oldironcrawler.extractor.llm_client import LlmExtractionResult, WebsiteLlmClient
 from oldironcrawler.extractor.page_pool import PageFetchPool
+from oldironcrawler.extractor.phone_rules import collect_phones_for_pages, join_phones
 from oldironcrawler.extractor.protocol_client import HtmlPage, ProtocolPermanentError, ProtocolTemporaryError, SiteProtocolClient, SiteProtocolConfig
+from oldironcrawler.extractor.shell_page import build_shell_fingerprint, enrich_shell_page_html, looks_like_shell_page
 from oldironcrawler.extractor.value_rules import (
     build_fetch_plan,
     build_candidates,
@@ -38,6 +40,7 @@ _DISCOVERY_REP_STRONG_TOKENS = {
     "governance",
     "impressum",
     "imprint",
+    "kontakt",
     "leadership",
     "management",
     "officers",
@@ -48,6 +51,8 @@ _DISCOVERY_REP_STRONG_TOKENS = {
     "principal",
     "solicitor",
     "team",
+    "uber",
+    "ueber",
 }
 
 
@@ -123,6 +128,7 @@ class SiteProfileService:
                 metrics,
                 deadline_monotonic,
             )
+            metrics.rep_url_count = len(rep_pages)
             metrics.fetched_page_count = len(page_map)
             self._store.update_stage_metrics(site_id, metrics)
             fetched_pages = list(page_map.values())
@@ -137,10 +143,10 @@ class SiteProfileService:
                 ),
             ))
             email_rule_pages = _collect_email_rule_pages(page_map, fetch_plan)
-            emails, email_sources = self._time_call(
+            emails, email_sources, phones, _phone_sources = self._time_call(
                 metrics,
                 "email_rule_ms",
-                lambda: collect_emails_for_pages(website, email_rule_pages),
+                lambda: _collect_contact_details(website, email_rule_pages),
             )
             self._store.update_stage_metrics(site_id, metrics)
             learning_feedback = build_learning_feedback(
@@ -159,6 +165,7 @@ class SiteProfileService:
                     representative=llm_result.representative,
                     emails=join_emails(emails),
                     website=website,
+                    phones=join_phones(phones),
                     evidence_url=llm_result.evidence_url,
                     evidence_quote=llm_result.evidence_quote,
                 ),
@@ -216,7 +223,22 @@ class SiteProfileService:
                 page_pool=self._page_pool,
             )
             _merge_pages_into_map(page_map, primary_pages)
-            rep_pages = _select_pages_from_map(page_map, fetch_plan["rep_urls"])
+            shell_alias_map = _build_shell_alias_map(
+                start_url=website,
+                page_map=page_map,
+                target_urls=[*fetch_plan["all_primary_urls"], *fetch_plan["email_overflow_urls"]],
+            )
+            primary_fetch_ms += _replace_shell_pages_with_evidence(
+                page_map,
+                [*fetch_plan["all_primary_urls"], *fetch_plan["email_overflow_urls"]],
+                proxy_url=self._config.proxy_url,
+                timeout_seconds=self._config.request_timeout_seconds,
+                deadline_monotonic=deadline_monotonic,
+            )
+            rep_pages = _select_pages_from_map(
+                page_map,
+                _canonicalize_target_urls(fetch_plan["rep_urls"], shell_alias_map),
+            )
             llm_result = self._extract_primary_representative(
                 website,
                 rep_pages,
@@ -231,6 +253,14 @@ class SiteProfileService:
                 llm_result,
             )
             _merge_pages_into_map(page_map, overflow_pages)
+            if overflow_pages:
+                overflow_fetch_ms += _replace_shell_pages_with_evidence(
+                    page_map,
+                    fetch_plan["email_overflow_urls"],
+                    proxy_url=self._config.proxy_url,
+                    timeout_seconds=self._config.request_timeout_seconds,
+                    deadline_monotonic=deadline_monotonic,
+                )
             return page_map, rep_pages, llm_result
         finally:
             metrics.fetch_pages_ms = primary_fetch_ms + overflow_fetch_ms
@@ -296,7 +326,138 @@ def _merge_page_targets(rep_urls: list[str], email_urls: list[str]) -> list[str]
     return result
 
 
+def _collect_contact_details(
+    website: str,
+    email_rule_pages: list[tuple[str, str]],
+) -> tuple[list[str], dict[str, list[str]], list[str], dict[str, list[str]]]:
+    emails, email_sources = collect_emails_for_pages(website, email_rule_pages)
+    phones, phone_sources = collect_phones_for_pages(email_rule_pages)
+    return emails, email_sources, phones, phone_sources
+
+
+def _replace_shell_pages_with_evidence(
+    page_map: dict[str, object],
+    target_urls: list[str],
+    *,
+    proxy_url: str,
+    timeout_seconds: float,
+    deadline_monotonic: float | None,
+) -> int:
+    started = time.monotonic()
+    for url in target_urls:
+        page = page_map.get(url)
+        if page is None or not looks_like_shell_page(getattr(page, "html", "")):
+            continue
+        enriched_html = enrich_shell_page_html(
+            page.url,
+            page.html,
+            proxy_url=proxy_url,
+            timeout_seconds=timeout_seconds,
+            deadline_monotonic=deadline_monotonic,
+        )
+        if enriched_html.strip() and enriched_html != page.html:
+            page_map[url] = HtmlPage(url=page.url, html=enriched_html)
+    return int(round((time.monotonic() - started) * 1000))
+
+
+def _build_shell_alias_map(
+    *,
+    start_url: str,
+    page_map: dict[str, object],
+    target_urls: list[str],
+) -> dict[str, str]:
+    ordered_urls = _merge_unique_urls([start_url], target_urls, limit=max(len(target_urls) + 1, 1))
+    fingerprint_to_urls: dict[str, list[str]] = {}
+    homepage_fingerprint = _page_shell_fingerprint(page_map.get(start_url))
+    for url in ordered_urls:
+        fingerprint = _page_shell_fingerprint(page_map.get(url))
+        if not fingerprint:
+            continue
+        fingerprint_to_urls.setdefault(fingerprint, []).append(url)
+    alias_map: dict[str, str] = {}
+    for fingerprint, urls in fingerprint_to_urls.items():
+        if len(urls) <= 1:
+            continue
+        canonical_url = _pick_shell_canonical_url(
+            start_url=start_url,
+            homepage_fingerprint=homepage_fingerprint,
+            fingerprint=fingerprint,
+            urls=urls,
+        )
+        for url in urls:
+            alias_map[url] = canonical_url
+    return alias_map
+
+
+def _canonicalize_target_urls(urls: list[str], alias_map: dict[str, str]) -> list[str]:
+    if not alias_map:
+        return [str(url or "").strip() for url in urls if str(url or "").strip()]
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw_url in urls:
+        url = str(raw_url or "").strip()
+        if not url:
+            continue
+        canonical = str(alias_map.get(url, url) or "").strip()
+        if not canonical or canonical in seen:
+            continue
+        seen.add(canonical)
+        result.append(canonical)
+    return result
+
+
+def _page_shell_fingerprint(page: object | None) -> str:
+    if page is None:
+        return ""
+    url = str(getattr(page, "url", "") or "").strip()
+    html_text = str(getattr(page, "html", "") or "")
+    if not url or not html_text:
+        return ""
+    return build_shell_fingerprint(url, html_text)
+
+
+def _pick_shell_canonical_url(
+    *,
+    start_url: str,
+    homepage_fingerprint: str,
+    fingerprint: str,
+    urls: list[str],
+) -> str:
+    if homepage_fingerprint and fingerprint == homepage_fingerprint and start_url in urls:
+        return start_url
+    return sorted(urls, key=_shell_canonical_sort_key)[0]
+
+
+def _shell_canonical_sort_key(url: str) -> tuple[int, int, int, str]:
+    lowered = str(url or "").strip().lower()
+    path = lowered.rstrip("/").split("://", 1)[-1].split("/", 1)[-1]
+    score = 0
+    for token, value in (
+        ("impressum", 120),
+        ("imprint", 118),
+        ("legal-notice", 110),
+        ("legal", 100),
+        ("contact-us", 94),
+        ("contact", 90),
+        ("about-us", 82),
+        ("about", 76),
+        ("company", 70),
+        ("our-team", 58),
+        ("team", 52),
+        ("people", 48),
+        ("executive-team", 18),
+        ("leadership", 12),
+        ("management", 8),
+    ):
+        if token in lowered:
+            score += value
+    depth = path.count("/") if path else 0
+    return (-score, depth, len(lowered), lowered)
+
+
 def _build_site_protocol_config(config: AppConfig, deadline_monotonic: float | None) -> SiteProtocolConfig:
+    page_concurrency = max(int(getattr(config, "page_concurrency", 1) or 1), 1)
+    page_worker_count = max(int(getattr(config, "page_worker_count", page_concurrency) or page_concurrency), 1)
     return SiteProtocolConfig(
         timeout_seconds=config.request_timeout_seconds,
         proxy_url=config.proxy_url,
@@ -307,13 +468,23 @@ def _build_site_protocol_config(config: AppConfig, deadline_monotonic: float | N
         capsolver_max_wait_seconds=config.capsolver_max_wait_seconds,
         cloudflare_proxy_url=config.cloudflare_proxy_url,
         deadline_monotonic=deadline_monotonic,
-        page_batch_timeout_seconds=max(
-            getattr(config, "total_wait_seconds", config.request_timeout_seconds * 2),
-            config.request_timeout_seconds * 2,
-        ),
-        common_probe_concurrency=max(int(config.page_concurrency or 1), 1),
-        request_slot_limit=max(int(config.page_concurrency or 1), 1),
+        page_batch_timeout_seconds=_resolve_page_batch_timeout_seconds(config),
+        common_probe_concurrency=page_concurrency,
+        probe_worker_count=page_worker_count,
+        request_slot_limit=page_worker_count,
     )
+
+
+def _resolve_page_batch_timeout_seconds(config: AppConfig) -> float:
+    """限制单轮目标页批抓时长，避免整站预算都耗在同一批卡住的子页上。"""
+
+    request_timeout = max(float(getattr(config, "request_timeout_seconds", 10.0) or 10.0), 1.0)
+    site_budget = max(
+        float(getattr(config, "total_wait_seconds", request_timeout * 2) or 0.0),
+        request_timeout * 2,
+    )
+    batch_ceiling = min(max(request_timeout * 4, 20.0), 45.0)
+    return max(min(site_budget, batch_ceiling), request_timeout * 2)
 
 
 def _discover_value_snapshot(

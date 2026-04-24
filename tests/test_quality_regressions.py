@@ -182,8 +182,10 @@ def test_build_common_probe_urls_prioritizes_imprint_and_people_paths() -> None:
     urls = protocol_module._build_common_probe_urls("https://example.com/en")
 
     assert "https://example.com/en/imprint" in urls
+    assert "https://example.com/en/kontakt" in urls
     assert "https://example.com/en/about-us/our-people" in urls
     assert urls.index("https://example.com/en/imprint") < urls.index("https://example.com/en/contact")
+    assert urls.index("https://example.com/en/kontakt") < urls.index("https://example.com/en/contact")
     assert urls.index("https://example.com/en/about-us/our-people") < urls.index("https://example.com/en/about")
 
 

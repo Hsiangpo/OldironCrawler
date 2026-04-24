@@ -23,6 +23,7 @@ class SiteResult:
     representative: str
     emails: str
     website: str
+    phones: str = ""
     evidence_url: str = ""
     evidence_quote: str = ""
 
@@ -103,6 +104,7 @@ class RuntimeStore:
                     company_name TEXT NOT NULL DEFAULT '',
                     representative TEXT NOT NULL DEFAULT '',
                     emails TEXT NOT NULL DEFAULT '',
+                    phones TEXT NOT NULL DEFAULT '',
                     evidence_url TEXT NOT NULL DEFAULT '',
                     evidence_quote TEXT NOT NULL DEFAULT '',
                     discover_ms INTEGER NOT NULL DEFAULT 0,
@@ -132,7 +134,16 @@ class RuntimeStore:
                 );
                 """
             )
+            self._ensure_site_text_columns(conn)
             self._ensure_site_metrics_columns(conn)
+
+    def _ensure_site_text_columns(self, conn: sqlite3.Connection) -> None:
+        existing = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(sites)").fetchall()
+        }
+        if "phones" not in existing:
+            conn.execute("ALTER TABLE sites ADD COLUMN phones TEXT NOT NULL DEFAULT ''")
 
     def _ensure_site_metrics_columns(self, conn: sqlite3.Connection) -> None:
         existing = {
@@ -214,6 +225,7 @@ class RuntimeStore:
                     company_name = '',
                     representative = '',
                     emails = '',
+                    phones = '',
                     evidence_url = '',
                     evidence_quote = '',
                     discover_ms = 0,
@@ -286,6 +298,7 @@ class RuntimeStore:
                     representative = ?,
                     emails = ?,
                     website = ?,
+                    phones = ?,
                     evidence_url = ?,
                     evidence_quote = ?,
                     finished_at = CURRENT_TIMESTAMP,
@@ -297,6 +310,7 @@ class RuntimeStore:
                     result.representative,
                     result.emails,
                     result.website,
+                    result.phones,
                     result.evidence_url,
                     result.evidence_quote,
                     site_id,
@@ -339,12 +353,13 @@ class RuntimeStore:
         with self._write_lock, self._connect() as conn:
             row = conn.execute("SELECT retry_count FROM sites WHERE id = ?", (site_id,)).fetchone()
             retry_count = int(row["retry_count"] or 0) if row is not None else 0
-            if retry_count <= 0:
+            max_retry_count = _max_retry_count_for_error(error_text)
+            if retry_count < max_retry_count:
                 conn.execute(
                     """
                     UPDATE sites
                     SET status = 'failed_temp',
-                        retry_count = 1,
+                        retry_count = retry_count + 1,
                         last_error = ?,
                         finished_at = CURRENT_TIMESTAMP
                     WHERE id = ?
@@ -393,7 +408,7 @@ class RuntimeStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT company_name, representative, emails, website
+                SELECT company_name, representative, emails, phones, website
                 FROM sites
                 WHERE status IN ('done', 'dropped')
                 ORDER BY input_index ASC
@@ -404,6 +419,7 @@ class RuntimeStore:
                 "company_name": str(row["company_name"] or ""),
                 "representative": str(row["representative"] or ""),
                 "emails": str(row["emails"] or ""),
+                "phones": str(row["phones"] or ""),
                 "website": str(row["website"] or ""),
             }
             for row in rows
@@ -451,3 +467,28 @@ def _close_connection_quietly(conn: sqlite3.Connection) -> None:
 
 
 _METRIC_COLUMNS = tuple(field.name for field in fields(SiteStageMetrics))
+
+
+def _max_retry_count_for_error(error_text: str) -> int:
+    lowered = str(error_text or "").lower()
+    if any(
+        token in lowered
+        for token in (
+            "tls connect error",
+            "tlsv1_alert",
+            "sslv3_alert_handshake_failure",
+            "openssl_internal",
+            "getaddrinfo() thread failed to start",
+            "thread failed to start",
+            "request_slot_timeout",
+            "llm_queue_timeout",
+            "resource temporarily unavailable",
+            "[errno 35]",
+            "page_batch_timeout",
+            "empty_page_batch",
+            "site_deadline_exceeded",
+            "temporary_request:",
+        )
+    ):
+        return 2
+    return 1

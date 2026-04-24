@@ -30,6 +30,7 @@ The new product must reuse that logic instead of inventing a separate extraction
 - Extract company name from website content
 - Extract one highest-value representative from website content
 - Extract all rule-valid public emails from website content
+- Extract all rule-valid public phones from website content
 - Resume from SQLite state
 - Deliver one CSV for one input file
 - Show terminal progress in a human-readable format
@@ -41,7 +42,7 @@ The new product must reuse that logic instead of inventing a separate extraction
 - Google Maps completion
 - Company directory sources
 - CRM-like UI
-- Extra delivery columns beyond the agreed 4 columns
+- Extra delivery columns beyond the agreed 5 columns
 
 ## 3. Hard Product Decisions
 
@@ -66,7 +67,10 @@ These decisions are fixed and should be treated as product rules.
 - Representative is selected by `LLM`
 - Representative must be a single highest-value person only
 - Emails are extracted by rules only
+- Phones are extracted by rules only
 - `LLM` must not be used to generate or supplement emails
+- `LLM` must not be used to generate or supplement phones
+- German `impressum` should be treated as a strong representative and contact signal
 - Representative selection must continue to use `html -> markdown`
 - Representative prompt should keep the current shared strictness:
   - no guessing
@@ -78,10 +82,11 @@ These decisions are fixed and should be treated as product rules.
 
 - Deliver all records
 - Do not require all fields to be non-empty before delivery
-- Final CSV contains exactly 4 columns:
+- Final CSV contains exactly 5 columns:
   - `company_name`
   - `representative`
   - `emails`
+  - `phones`
   - `website`
 
 ### 3.5 Display Policy
@@ -96,6 +101,7 @@ This applies to:
 - company name
 - representative
 - emails
+- phones
 
 ### 3.6 Email Output Format
 
@@ -107,14 +113,22 @@ This applies to:
   - keep real offsite but meaningful emails
   - remove only obviously fake / placeholder / script-noise / directory-noise emails
 
-### 3.7 Deduplication Policy
+### 3.7 Phone Output Format
+
+- Multiple phones are joined by `; `
+- No upper limit on the number of kept phones
+- Keep rule-valid public phones only
+- Prefer real contact numbers from `tel:` links, visible contact text, legal pages, and embedded structured content
+- Do not keep obvious numeric noise, IDs, timestamps, or fax-only artifacts
+
+### 3.8 Deduplication Policy
 
 - Deduplicate by website first
 - If only a bare domain is available, deduplicate by domain
 - Different websites are treated as different records, even if the company appears related
 - Do not merge records only because the company name looks the same
 
-### 3.8 Output Order
+### 3.9 Output Order
 
 - Final CSV must follow input order
 - Do not reorder by completion time
@@ -221,7 +235,7 @@ The system must support:
 
 ### 6.4 Internal Metadata
 
-The final CSV only contains 4 columns, but the SQLite database may store internal fields such as:
+The final CSV only contains 5 columns, but the SQLite database may store internal fields such as:
 
 - normalized website
 - evidence url
@@ -469,12 +483,19 @@ Typical examples:
 - do not cap the number
 - join with `; `
 
+### 13.4 Phones
+
+- extract all valid public phones from all matched contact-value pages
+- do not cap the number
+- join with `; `
+- use rules only, not `LLM`
+
 ## 14. Delivery File
 
 Final CSV schema:
 
 ```csv
-company_name,representative,emails,website
+company_name,representative,emails,phones,website
 ```
 
 Rules:
@@ -504,8 +525,8 @@ The new product may improve the current shared logic, but it must not weaken the
 - `pc` first
 - representative via `LLM`
 - emails via rules
+- phones via rules
 - strict anti-hallucination for representative
 - lightweight runtime
 - resumable SQLite state
 - simple terminal UX
-

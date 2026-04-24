@@ -4,6 +4,10 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.tmp_trace/
+build/
+dist/
 output/
 tmp/
+%SystemDrive%/
 .codex/skills/protocol-crawler/.env_checked

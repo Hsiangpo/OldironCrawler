@@ -17,8 +17,9 @@ from oldironcrawler import app as app_module
 from oldironcrawler import console as console_module
 from oldironcrawler import dashboard as dashboard_module
 from oldironcrawler.extractor import llm_client as llm_module
-from oldironcrawler.extractor.llm_client import LlmConfigurationError
+from oldironcrawler.extractor.llm_client import LlmConfigurationError, LlmTemporaryError, WebsiteLlmClient
 from oldironcrawler.importer import ImportedWebsite
+from oldironcrawler.runtime.store import RuntimeStore
 
 
 def _build_status_error(status_code: int, payload: dict[str, object]):
@@ -229,6 +230,8 @@ def test_run_interactive_auto_retries_same_key_after_temporary_llm_outage(tmp_pa
 
     monkeypatch.setattr(app_module, "_load_input_rows", fake_load_rows)
     monkeypatch.setattr(app_module, "RuntimeStore", _FakeRuntimeStore)
+    sleep_calls: list[int] = []
+    monkeypatch.setattr(app_module.time, "sleep", lambda seconds: sleep_calls.append(int(seconds)))
 
     def fake_run(config, store, delivery_path) -> None:
         run_calls.append(config.llm_key)
@@ -252,6 +255,7 @@ def test_run_interactive_auto_retries_same_key_after_temporary_llm_outage(tmp_pa
     assert selected_files == [workbook]
     assert load_rows_calls == ["steady-key"]
     assert run_calls == ["steady-key", "steady-key"]
+    assert sleep_calls == [3]
     assert "程序将自动重试" in capsys.readouterr().out
 
 
@@ -292,6 +296,67 @@ def test_run_dashboard_validates_key_before_showing_panel(tmp_path: Path, monkey
     ]
 
 
+def test_run_dashboard_retries_temporary_validation_error_without_crashing(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "LLM_BASE_URL=https://example.com/v1",
+                "LLM_MODEL=gpt-5.4-mini",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    event_log: list[str] = []
+    answers = iter(["5"])
+
+    def fake_validate(config) -> None:
+        event_log.append(f"validate:{config.llm_key}")
+        if len(event_log) == 1:
+            raise LlmTemporaryError("503 service_temporarily_unavailable")
+
+    monkeypatch.setattr(app_module, "_validate_llm_runtime", fake_validate)
+    sleep_calls: list[int] = []
+    monkeypatch.setattr(app_module.time, "sleep", lambda seconds: sleep_calls.append(int(seconds)))
+    monkeypatch.setattr(dashboard_module, "_render_panel", lambda title, lines: event_log.append(f"panel:{title}"))
+    monkeypatch.setattr(dashboard_module, "_clear_screen", lambda: None)
+    monkeypatch.setattr(dashboard_module, "wait_for_enter", lambda *args, **kwargs: None)
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+
+    result = dashboard_module.run_dashboard(tmp_path, "steady-key")
+
+    assert result == 0
+    assert event_log[:3] == [
+        "validate:steady-key",
+        "validate:steady-key",
+        "panel:OldIronCrawler 控制面板",
+    ]
+    assert sleep_calls == [3]
+
+
+def test_reset_running_tasks_recovers_real_sqlite_rows(tmp_path: Path) -> None:
+    db_path = tmp_path / "runtime.sqlite3"
+    store = RuntimeStore(db_path)
+    rows = [ImportedWebsite(input_index=1, raw_website="acme.com", website="https://acme.com", dedupe_key="acme.com")]
+    store.prepare_job(input_name="sites.xlsx", fingerprint="fp-1", rows=rows)
+
+    claimed = store.claim_next_site()
+
+    assert claimed is not None
+    assert store.progress()["running"] == 1
+    store.close()
+
+    reopened = RuntimeStore(db_path)
+    reopened.reset_running_tasks()
+    progress = reopened.progress()
+    reclaimed = reopened.claim_next_site()
+    reopened.close()
+
+    assert progress["running"] == 0
+    assert progress["pending"] == 1
+    assert reclaimed is not None
+    assert reclaimed.id == claimed.id
+
+
 def test_run_dashboard_persists_validated_key_to_env(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / ".env").write_text(
         "\n".join(
@@ -317,6 +382,33 @@ def test_run_dashboard_persists_validated_key_to_env(tmp_path: Path, monkeypatch
     assert result == 0
     assert "LLM_KEY=saved-key" in env_text
     assert "LLM_API_KEY=saved-key" in env_text
+
+
+def test_llm_ping_rejects_invalid_response_payload(monkeypatch) -> None:
+    client = WebsiteLlmClient(
+        api_key="test-key",
+        base_url="https://example.com/v1",
+        model="gpt-5.4-mini",
+        api_style="responses",
+        reasoning_effort="low",
+        proxy_url="",
+        timeout_seconds=5.0,
+        concurrency_limit=1,
+    )
+    monkeypatch.setattr(client, "_call_json", lambda *_args, **_kwargs: {})
+
+    with pytest.raises(RuntimeError, match="llm_ping_invalid_response"):
+        client.ping()
+
+    client.close()
+
+
+def test_classify_invalid_ping_response_as_temporary_issue() -> None:
+    details = llm_module.classify_llm_exception("llm_ping_invalid_response")
+
+    assert details is not None
+    assert details.prompt_mode == "retry"
+    assert details.category == "temporary_unavailable"
 
 
 def test_run_dashboard_retries_invalid_file_choice_inside_panel(tmp_path: Path, monkeypatch) -> None:

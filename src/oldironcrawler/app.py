@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import time
 
 from oldironcrawler.bootstrap import raise_nofile_soft_limit
 from oldironcrawler import console as console_module
@@ -18,6 +19,15 @@ class CrawlRunResult:
     exit_code: int
     delivery_path: Path
     effective_key: str
+
+
+@dataclass(frozen=True)
+class RuntimeConcurrencyBudget:
+    site_concurrency: int
+    llm_concurrency: int
+    page_concurrency: int
+    page_worker_count: int
+    page_host_limit: int
 
 
 def run_interactive(project_root: Path | None = None, llm_key_override: str | None = None) -> int:
@@ -45,8 +55,9 @@ def run_selected_input(
         concurrency=concurrency,
         site_timeout_seconds=site_timeout_seconds,
     )
-    db_path = config.runtime_dir / f"{input_path.stem}.sqlite3"
-    delivery_path = config.delivery_dir / f"{input_path.stem}.csv"
+    artifact_stem = _build_artifact_stem(input_path)
+    db_path = config.runtime_dir / f"{artifact_stem}.sqlite3"
+    delivery_path = config.delivery_dir / f"{artifact_stem}.csv"
     store = RuntimeStore(db_path)
     try:
         exit_code, effective_key = _run_session_with_llm_recovery(
@@ -72,6 +83,11 @@ def _resolve_initial_llm_key(project_root: Path, llm_key_override: str | None) -
     if str(llm_key_override or "").strip():
         return str(llm_key_override).strip()
     return read_saved_llm_key(project_root)
+
+
+def _build_artifact_stem(input_path: Path) -> str:
+    suffix = str(input_path.suffix or "").strip().lower().lstrip(".") or "txt"
+    return f"{input_path.stem}-{suffix}"
 
 
 def _load_runtime_config(project_root: Path, llm_key_override: str) -> AppConfig:
@@ -160,6 +176,7 @@ def _run_session_with_llm_recovery(
             print(f"检测到 {input_path.name} 上次已经跑完，本次已重置后重新跑。", flush=True)
         db_path = getattr(store, "_db_path", getattr(store, "db_path", ""))
         print(f"开始任务：file={input_path.name} total={progress['total']} db={db_path}", flush=True)
+        print(_format_runtime_budget(config), flush=True)
         try:
             run_crawl_session(config, store, delivery_path)
             print(f"交付完成：{delivery_path}", flush=True)
@@ -180,7 +197,14 @@ def _recover_runtime_llm_key(current_key: str, exc: Exception) -> str:
             print(failure.user_message, flush=True)
             return console_module.prompt_runtime_llm_key()
     print(f"{failure.user_message} 程序将自动重试。", flush=True)
+    time.sleep(_retry_wait_seconds(failure.retry_after_seconds))
     return current_key
+
+
+def _retry_wait_seconds(retry_after_seconds: int | None) -> int:
+    if retry_after_seconds is None:
+        return 3
+    return min(max(int(retry_after_seconds), 1), 30)
 
 
 def _persist_runtime_llm_key(project_root: Path, llm_key: str) -> None:
@@ -210,14 +234,41 @@ def _apply_runtime_preferences(
     concurrency: int,
     site_timeout_seconds: int,
 ) -> None:
-    bounded_concurrency = min(max(int(concurrency), 1), 64)
+    budget = _derive_runtime_concurrency_budget(concurrency)
     bounded_timeout = min(max(int(site_timeout_seconds), 60), 600)
-    config.llm_concurrency = bounded_concurrency
-    config.site_concurrency = bounded_concurrency
-    config.page_concurrency = bounded_concurrency
-    config.page_worker_count = bounded_concurrency
-    config.page_host_limit = bounded_concurrency
+    config.llm_concurrency = budget.llm_concurrency
+    config.site_concurrency = budget.site_concurrency
+    config.page_concurrency = budget.page_concurrency
+    config.page_worker_count = budget.page_worker_count
+    config.page_host_limit = budget.page_host_limit
     config.total_wait_seconds = float(bounded_timeout)
+
+
+def _derive_runtime_concurrency_budget(concurrency: int) -> RuntimeConcurrencyBudget:
+    site_concurrency = min(max(int(concurrency), 1), 64)
+    llm_concurrency = min(site_concurrency, max(min(site_concurrency // 4, 12), 4))
+    page_concurrency = min(site_concurrency, max(min(site_concurrency // 4 + 2, 12), 4))
+    page_worker_count = min(max(page_concurrency * 3, site_concurrency, 4), 32)
+    page_host_limit = min(max(page_concurrency // 3, 2), 4)
+    return RuntimeConcurrencyBudget(
+        site_concurrency=site_concurrency,
+        llm_concurrency=llm_concurrency,
+        page_concurrency=page_concurrency,
+        page_worker_count=page_worker_count,
+        page_host_limit=page_host_limit,
+    )
+
+
+def _format_runtime_budget(config: AppConfig) -> str:
+    return (
+        "运行预算："
+        f"站点并发={config.site_concurrency}，"
+        f"LLM并发={config.llm_concurrency}，"
+        f"公共探测批量={config.page_concurrency}，"
+        f"全局抓页线程={config.page_worker_count}，"
+        f"同主机抓页上限={config.page_host_limit}，"
+        f"单站超时={int(config.total_wait_seconds)}秒"
+    )
 
 
 def _load_input_rows(config: AppConfig, input_path: Path):

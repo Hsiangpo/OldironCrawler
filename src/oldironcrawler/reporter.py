@@ -14,6 +14,7 @@ def print_site_result(
     company_name: str,
     representative: str,
     emails: str,
+    phones: str = "",
     reason: str = "",
     stage_metrics: SiteStageMetrics | None = None,
 ) -> None:
@@ -21,6 +22,7 @@ def print_site_result(
     print(f"  公司名: {_display(company_name)}", flush=True)
     print(f"  姓名: {_display(representative)}", flush=True)
     print(f"  邮箱: {_display(emails)}", flush=True)
+    print(f"  电话: {_display(phones)}", flush=True)
     if stage_metrics is not None:
         print(f"  阶段耗时: {_format_stage_timing(stage_metrics)}", flush=True)
         print(f"  页面统计: {_format_stage_counts(stage_metrics)}", flush=True)
@@ -40,7 +42,7 @@ def write_delivery_csv(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_name(f"{path.name}.tmp")
     with temp_path.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["company_name", "representative", "emails", "website"])
+        writer = csv.DictWriter(handle, fieldnames=["company_name", "representative", "emails", "phones", "website"])
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
@@ -59,7 +61,7 @@ def _format_stage_timing(metrics: SiteStageMetrics) -> str:
             f"LLM选页 {metrics.llm_pick_ms / 1000:.1f}s",
             f"抓页 {metrics.fetch_pages_ms / 1000:.1f}s",
             f"LLM抽取 {metrics.llm_extract_ms / 1000:.1f}s",
-            f"邮箱规则 {metrics.email_rule_ms / 1000:.1f}s",
+            f"联系方式规则 {metrics.email_rule_ms / 1000:.1f}s",
             f"公司规则 {metrics.company_rule_ms / 1000:.1f}s",
         ]
     )

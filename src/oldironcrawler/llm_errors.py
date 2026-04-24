@@ -129,7 +129,18 @@ def classify_llm_exception(exc: BaseException | str) -> LlmIntervention | None:
     if (
         isinstance(exc, (APIConnectionError, APITimeoutError, httpx.TimeoutException, httpx.NetworkError))
         or isinstance(exc, APIStatusError) and (status_code or 0) >= 500
-        or _contains_any(text, ("timeout", "timed out", "connection", "remoteprotocolerror", "server disconnected", "upstream"))
+        or _contains_any(
+            text,
+            (
+                "timeout",
+                "timed out",
+                "connection",
+                "llm_ping_invalid_response",
+                "remoteprotocolerror",
+                "server disconnected",
+                "upstream",
+            ),
+        )
     ):
         return _build_intervention(
             category="temporary_unavailable",

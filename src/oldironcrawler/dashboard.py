@@ -10,7 +10,7 @@ from pathlib import Path
 from oldironcrawler import app as app_module
 from oldironcrawler.config import resolve_websites_dir
 from oldironcrawler.console import prompt_runtime_llm_key, wait_for_enter
-from oldironcrawler.extractor.llm_client import LlmConfigurationError
+from oldironcrawler.extractor.llm_client import LlmConfigurationError, LlmTemporaryError
 from oldironcrawler.importer import list_input_files
 
 
@@ -81,7 +81,7 @@ def _ensure_key_before_panel(session: DashboardSession) -> None:
             app_module._validate_llm_runtime(config)
             app_module._persist_runtime_llm_key(session.project_root, session.current_key)
             return
-        except LlmConfigurationError as exc:
+        except (LlmConfigurationError, LlmTemporaryError) as exc:
             session.current_key = app_module._recover_runtime_llm_key(session.current_key, exc)
 
 

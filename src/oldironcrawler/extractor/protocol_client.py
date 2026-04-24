@@ -59,6 +59,7 @@ _TEMP_ERROR_HINTS = (
     "resource temporarily unavailable",
     "[errno 35]",
     "request_slot_timeout",
+    "challenge_refetch_failed",
 )
 _PERMANENT_ERROR_HINTS = (
     "could not resolve host",
@@ -83,6 +84,10 @@ _CLOUDFLARE_CHALLENGE_HINTS = (
     "challenge-platform",
     "cf-challenge",
     "attention required! | cloudflare",
+)
+_SOFT_CHALLENGE_HINTS = (
+    ".well-known/sgcaptcha",
+    "sgcaptcha",
 )
 _INCAPSULA_CHALLENGE_HINTS = (
     "_incapsula_resource",
@@ -124,6 +129,7 @@ class SiteProtocolConfig:
     deadline_monotonic: float | None = None
     common_probe_target: int = 8
     common_probe_concurrency: int = 8
+    probe_worker_count: int = 16
     common_probe_patience_batches: int = 2
     common_probe_min_hits_after_patience: int = 2
     related_seed_limit: int = 2
@@ -136,7 +142,7 @@ class SiteProtocolClient:
     def __init__(self, config: SiteProtocolConfig) -> None:
         self._config = config
         configure_protocol_runtime(
-            probe_workers=max(config.common_probe_concurrency, 1),
+            probe_workers=max(config.probe_worker_count, 1),
             request_slots=max(config.request_slot_limit, 1),
         )
         self._http_client = self._build_httpx_client()
@@ -206,11 +212,14 @@ class SiteProtocolClient:
         if self._config.deadline_monotonic is not None:
             deadline = min(deadline, self._config.deadline_monotonic)
         if page_pool is not None and filtered:
-            return page_pool.fetch_pages(
+            pages = page_pool.fetch_pages(
                 urls=filtered,
                 fetch_one=lambda url: self._fetch_page_optional(url, timeout_seconds=min(self._config.timeout_seconds, max(deadline - time.monotonic(), 0.01))),
                 deadline_monotonic=deadline,
             )
+            if pages:
+                return pages
+            raise ProtocolTemporaryError(_build_empty_page_batch_error(filtered))
         for url in filtered:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -227,6 +236,8 @@ class SiteProtocolClient:
             raise last_error
         if not pages and timed_out:
             raise TimeoutError("page_batch_timeout")
+        if not pages and filtered:
+            raise ProtocolTemporaryError(_build_empty_page_batch_error(filtered))
         return pages
     def _fetch_page_optional(self, url: str, *, timeout_seconds: float | None = None) -> HtmlPage | None:
         session = self._get_or_create_session()
@@ -251,16 +262,19 @@ class SiteProtocolClient:
         session.headers.update(self._config.default_headers)
         return session
     def _build_httpx_client(self) -> httpx.Client:
+        return httpx.Client(**self._build_httpx_client_kwargs(self._config.timeout_seconds))
+
+    def _build_httpx_client_kwargs(self, timeout_seconds: float) -> dict[str, object]:
         client_kwargs: dict[str, object] = {
             "follow_redirects": True,
             "headers": dict(self._config.default_headers),
-            "timeout": self._config.timeout_seconds,
+            "timeout": timeout_seconds,
             "limits": httpx.Limits(max_connections=128, max_keepalive_connections=32, keepalive_expiry=30.0),
             "trust_env": False,
         }
         if self._config.proxy_url:
             client_kwargs["proxy"] = self._config.proxy_url
-        return httpx.Client(**client_kwargs)
+        return client_kwargs
     def _fetch_html(
         self,
         session: cffi_requests.Session,
@@ -291,10 +305,24 @@ class SiteProtocolClient:
                 if status in {429, 500, 502, 503, 504}:
                     raise ProtocolTemporaryError(f"temporary_http_{status}: {url}")
                 if status == 403:
-                    challenge_text = _truncate_html(_decode_response_text(response), self._config.max_html_chars)
-                    challenge_text = self._maybe_challenge_fallback(session, url, challenge_text, request_timeout)
+                    original_text = _truncate_html(_decode_response_text(response), self._config.max_html_chars)
+                    original_kind = _detect_challenge_kind(original_text)
+                    challenge_text = self._maybe_challenge_fallback(session, url, original_text, request_timeout)
                     _raise_if_challenge_page(url, challenge_text)
-                    return challenge_text
+                    if original_kind and challenge_text.strip():
+                        return challenge_text
+                    raise ProtocolPermanentError(f"http_403: {url}")
+                if status in {202, 404}:
+                    response_text = _truncate_html(_decode_response_text(response), self._config.max_html_chars)
+                    httpx_html = self._try_httpx_status_fallback(
+                        url,
+                        status_code=status,
+                        response_text=response_text,
+                        timeout_seconds=request_timeout,
+                    )
+                    if httpx_html is not None:
+                        return httpx_html
+                    _raise_if_challenge_page(url, response_text)
                 if status == 404:
                     return ""
                 if required:
@@ -307,9 +335,10 @@ class SiteProtocolClient:
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 lowered = str(exc).lower()
-                httpx_html = self._try_httpx_fallback(url, lowered)
-                if httpx_html is not None:
-                    return httpx_html
+                if _should_prefer_httpx_fallback(lowered):
+                    httpx_html = self._try_httpx_fallback(url, lowered)
+                    if httpx_html is not None:
+                        return httpx_html
                 insecure_html = self._try_insecure_https_fallback(url, lowered)
                 if insecure_html is not None:
                     return insecure_html
@@ -319,6 +348,9 @@ class SiteProtocolClient:
                 www_html = self._try_www_fallback(session, url, lowered)
                 if www_html is not None:
                     return www_html
+                httpx_html = self._try_httpx_fallback(url, lowered)
+                if httpx_html is not None:
+                    return httpx_html
                 if any(hint in lowered for hint in _PERMANENT_ERROR_HINTS):
                     raise ProtocolPermanentError(str(exc)) from exc
                 if any(hint in lowered for hint in _TEMP_ERROR_HINTS):
@@ -367,7 +399,7 @@ class SiteProtocolClient:
             max_html_chars=self._config.max_html_chars,
             session_headers=getattr(session, "headers", None) or {},
             cookie_jar=getattr(session, "cookies", None),
-            detect_challenge=lambda value: bool(_detect_challenge_kind(value)),
+            detect_challenge_kind=_detect_challenge_kind,
             refetch_html=lambda: self._refetch_challenge_html(session, url, timeout_seconds),
             capsolver_api_key=self._config.capsolver_api_key,
             capsolver_api_base_url=self._config.capsolver_api_base_url,
@@ -405,23 +437,83 @@ class SiteProtocolClient:
                 except Exception:  # noqa: BLE001
                     pass
 
-    def _try_httpx_fallback(self, url: str, lowered_error: str) -> str | None:
+    def _try_httpx_fallback(
+        self,
+        url: str,
+        lowered_error: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> str | None:
         if not _should_try_httpx_fallback(lowered_error):
             return None
         try:
-            request_timeout = self._resolve_timeout()
-            with request_slot(timeout_seconds=request_timeout):
-                response = self._http_client.get(url, timeout=request_timeout)
-            if int(response.status_code) != 200:
-                return None
-            content_type = str(response.headers.get("Content-Type", "") or "").lower()
-            if not _is_supported_response(url, content_type):
-                return None
-            html_text = _truncate_html(response.text, self._config.max_html_chars)
-            _raise_if_challenge_page(url, html_text)
-            return html_text
+            return self._request_httpx_html(url, timeout_seconds=timeout_seconds)
         except Exception:  # noqa: BLE001
             return None
+
+    def _try_httpx_status_fallback(
+        self,
+        url: str,
+        *,
+        status_code: int,
+        response_text: str,
+        timeout_seconds: float | None = None,
+    ) -> str | None:
+        if not _should_try_httpx_status_fallback(url, status_code, response_text):
+            return None
+        try:
+            return self._request_httpx_html(url, timeout_seconds=timeout_seconds)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _request_httpx_html(self, url: str, *, timeout_seconds: float | None = None) -> str | None:
+        request_timeout = self._resolve_timeout(timeout_seconds)
+        last_challenge_html = ""
+        for _attempt in range(2):
+            status, content_type, response_text = self._fetch_httpx_snapshot(
+                url,
+                timeout_seconds=request_timeout,
+                fresh_client=bool(_attempt),
+            )
+            if status == 200:
+                if not _is_supported_response(url, content_type):
+                    return None
+                challenge_kind = _detect_challenge_kind(response_text)
+                if challenge_kind:
+                    last_challenge_html = response_text
+                    continue
+                return response_text
+            if status in {202, 403} and _detect_challenge_kind(response_text):
+                last_challenge_html = response_text
+                continue
+            return None
+        if last_challenge_html:
+            _raise_if_challenge_page(url, last_challenge_html)
+        return None
+
+    def _fetch_httpx_snapshot(
+        self,
+        url: str,
+        *,
+        timeout_seconds: float,
+        fresh_client: bool,
+    ) -> tuple[int, str, str]:
+        if fresh_client:
+            with httpx.Client(**self._build_httpx_client_kwargs(timeout_seconds)) as client:
+                with request_slot(timeout_seconds=timeout_seconds):
+                    response = client.get(url, timeout=timeout_seconds)
+                return (
+                    int(response.status_code),
+                    str(response.headers.get("Content-Type", "") or "").lower(),
+                    _truncate_html(str(response.text or ""), self._config.max_html_chars),
+                )
+        with request_slot(timeout_seconds=timeout_seconds):
+            response = self._http_client.get(url, timeout=timeout_seconds)
+        return (
+            int(response.status_code),
+            str(response.headers.get("Content-Type", "") or "").lower(),
+            _truncate_html(str(response.text or ""), self._config.max_html_chars),
+        )
 
     def _try_insecure_https_fallback(self, url: str, lowered_error: str) -> str | None:
         if not _should_try_http_fallback(url, lowered_error):
@@ -603,7 +695,7 @@ class SiteProtocolClient:
         homepage_error: Exception | None = None
         try:
             homepage_html = self._fetch_html(session, start_url, required=False)
-        except ProtocolPermanentError as exc:
+        except (ProtocolPermanentError, ProtocolTemporaryError) as exc:
             homepage_error = exc
         guessed_urls = self._probe_common_value_urls(session, start_url, limit=limit)
         homepage_links = _extract_same_site_links(homepage_html, start_url, limit=limit) if homepage_html else []
@@ -689,8 +781,9 @@ class SiteProtocolClient:
                 timeout_seconds=min(self._config.timeout_seconds, 4.0),
                 max_retries_override=0,
             )
-        except ProtocolPermanentError as exc:
-            return probe_url if "challenge" in str(exc).lower() else None
+        except ProtocolPermanentError:
+            # 公共探测阶段只保留真实正文页，挑战页不再当成“命中页”。
+            return None
         return probe_url if html_text.strip() else None
 
     def _has_enough_discovery_hits(self, urls: list[str]) -> bool:
@@ -786,12 +879,45 @@ def _should_try_httpx_fallback(lowered_error: str) -> bool:
     return any(
         token in lowered_error
         for token in (
+            "tls connect error",
+            "tlsv1_alert",
+            "sslv3_alert_handshake_failure",
+            "openssl_internal",
             "getaddrinfo() thread failed to start",
             "thread failed to start",
             "couldn't create thread",
             "failed to create thread",
+            "empty reply from server",
+            "timed out",
+            "timeout",
+            "connection reset",
+            "recv failure",
+            "connection closed abruptly",
         )
     )
+
+
+def _should_prefer_httpx_fallback(lowered_error: str) -> bool:
+    return any(
+        token in lowered_error
+        for token in (
+            "tls connect error",
+            "tlsv1_alert",
+            "sslv3_alert_handshake_failure",
+            "openssl_internal",
+        )
+    )
+
+
+def _should_try_httpx_status_fallback(url: str, status_code: int, response_text: str) -> bool:
+    if status_code == 202:
+        return True
+    if status_code != 404:
+        return False
+    if _is_root_like_url(url):
+        return True
+    lowered = str(response_text or "").lower()
+    return any(token in lowered for token in ("wixerrorpagesapp", "page not found", "not found"))
 
 
 def _replace_https_with_http(url: str) -> str:
@@ -808,6 +934,21 @@ def _build_www_fallback_url(url: str, lowered_error: str) -> str:
     if not host or host.lower().startswith("www."):
         return ""
     return parsed._replace(netloc=f"www.{host}").geturl()
+
+
+def _is_root_like_url(url: str) -> bool:
+    parsed = urlparse(str(url or ""))
+    path = str(parsed.path or "").strip()
+    return not path or path == "/"
+
+
+def _build_empty_page_batch_error(urls: list[str]) -> str:
+    if not urls:
+        return "empty_page_batch"
+    preview = ", ".join(urls[:2])
+    if len(urls) > 2:
+        preview = f"{preview}, ..."
+    return f"empty_page_batch: {preview}"
 
 
 def _is_supported_response(url: str, content_type: str) -> bool:
@@ -932,6 +1073,8 @@ def _detect_challenge_kind(html_text: str) -> str:
         return ""
     if any(hint in lowered for hint in _CLOUDFLARE_CHALLENGE_HINTS):
         return "cloudflare_challenge"
+    if any(hint in lowered for hint in _SOFT_CHALLENGE_HINTS):
+        return "sgcaptcha_challenge"
     if any(hint in lowered for hint in _INCAPSULA_CHALLENGE_HINTS):
         return "imperva_challenge"
     return ""

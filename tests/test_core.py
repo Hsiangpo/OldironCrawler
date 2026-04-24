@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import time
 import threading
+from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,9 +19,11 @@ from oldironcrawler.app import _raise_nofile_soft_limit
 from oldironcrawler import challenge_solver as challenge_module
 from oldironcrawler.extractor.company_rules import extract_company_name_fallback
 from oldironcrawler.extractor.email_rules import collect_emails_for_pages
+from oldironcrawler.extractor.phone_rules import collect_phones_for_pages, join_phones
 from oldironcrawler.extractor import llm_client as llm_module
 from oldironcrawler.extractor import protocol_client as protocol_module
 from oldironcrawler.extractor import protocol_runtime as protocol_runtime_module
+from oldironcrawler.extractor import shell_page as shell_page_module
 from oldironcrawler.challenge_solver import CloudflareFallbackResult, CapSolverResult
 from oldironcrawler.extractor.llm_client import LlmConfigurationError, LlmExtractionResult, LlmTemporaryError, WebsiteLlmClient
 from oldironcrawler.extractor.page_pool import PageFetchPool, PageFetchPoolConfig
@@ -177,7 +180,7 @@ def test_store_failed_temp_goes_queue_tail_then_drops(tmp_path: Path) -> None:
 
     store.mark_done(
         second.id,
-        SiteResult(company_name="B", representative="", emails="", website="https://b.com"),
+        SiteResult(company_name="B", representative="", emails="", website="https://b.com", phones=""),
     )
     retry = store.claim_next_site()
     assert retry is not None
@@ -194,6 +197,83 @@ def test_store_failed_temp_goes_queue_tail_then_drops(tmp_path: Path) -> None:
     assert progress["dropped"] == 1
 
 
+def test_store_tls_transport_error_gets_extra_retry_budget(tmp_path: Path) -> None:
+    db_path = tmp_path / "runtime.sqlite3"
+    store = RuntimeStore(db_path)
+    rows = [
+        ImportedWebsite(input_index=1, raw_website="a.com", website="https://a.com", dedupe_key="a.com"),
+    ]
+    error_text = (
+        "Failed to perform, curl: (35) TLS connect error: "
+        "error:00000000:invalid library (0):OPENSSL_internal:invalid library (0)."
+    )
+    store.prepare_job(input_name="sites.txt", fingerprint="abc", rows=rows)
+
+    first = store.claim_next_site()
+    assert first is not None
+    assert store.mark_failed(first.id, error_text) == "failed_temp"
+
+    second = store.claim_next_site()
+    assert second is not None
+    assert second.id == first.id
+    assert store.mark_failed(second.id, error_text) == "failed_temp"
+
+    third = store.claim_next_site()
+    assert third is not None
+    assert third.id == first.id
+    assert store.mark_failed(third.id, error_text) == "dropped"
+
+    progress = store.progress()
+    assert progress["failed_temp"] == 0
+    assert progress["dropped"] == 1
+
+
+def test_store_llm_queue_timeout_gets_extra_retry_budget(tmp_path: Path) -> None:
+    db_path = tmp_path / "runtime.sqlite3"
+    store = RuntimeStore(db_path)
+    rows = [
+        ImportedWebsite(input_index=1, raw_website="a.com", website="https://a.com", dedupe_key="a.com"),
+    ]
+    store.prepare_job(input_name="sites.txt", fingerprint="abc", rows=rows)
+
+    first = store.claim_next_site()
+    assert first is not None
+    assert store.mark_failed(first.id, "llm_queue_timeout") == "failed_temp"
+
+    second = store.claim_next_site()
+    assert second is not None
+    assert second.id == first.id
+    assert store.mark_failed(second.id, "llm_queue_timeout") == "failed_temp"
+
+    third = store.claim_next_site()
+    assert third is not None
+    assert third.id == first.id
+    assert store.mark_failed(third.id, "llm_queue_timeout") == "dropped"
+
+
+def test_store_empty_page_batch_gets_extra_retry_budget(tmp_path: Path) -> None:
+    db_path = tmp_path / "runtime.sqlite3"
+    store = RuntimeStore(db_path)
+    rows = [
+        ImportedWebsite(input_index=1, raw_website="a.com", website="https://a.com", dedupe_key="a.com"),
+    ]
+    store.prepare_job(input_name="sites.txt", fingerprint="abc", rows=rows)
+
+    first = store.claim_next_site()
+    assert first is not None
+    assert store.mark_failed(first.id, "empty_page_batch: https://a.com/contact") == "failed_temp"
+
+    second = store.claim_next_site()
+    assert second is not None
+    assert second.id == first.id
+    assert store.mark_failed(second.id, "empty_page_batch: https://a.com/contact") == "failed_temp"
+
+    third = store.claim_next_site()
+    assert third is not None
+    assert third.id == first.id
+    assert store.mark_failed(third.id, "empty_page_batch: https://a.com/contact") == "dropped"
+
+
 def test_completed_job_can_be_reset_for_rerun(tmp_path: Path) -> None:
     db_path = tmp_path / "runtime.sqlite3"
     store = RuntimeStore(db_path)
@@ -205,7 +285,16 @@ def test_completed_job_can_be_reset_for_rerun(tmp_path: Path) -> None:
     first = store.claim_next_site()
     second = store.claim_next_site()
     assert first is not None and second is not None
-    store.mark_done(first.id, SiteResult(company_name="A", representative="Alice Smith", emails="a@a.com", website="https://a.com"))
+    store.mark_done(
+        first.id,
+        SiteResult(
+            company_name="A",
+            representative="Alice Smith",
+            emails="a@a.com",
+            website="https://a.com",
+            phones="+49301234567",
+        ),
+    )
     store.mark_dropped(second.id, "http_401")
 
     reset = store.reset_completed_job_for_rerun()
@@ -215,6 +304,36 @@ def test_completed_job_can_be_reset_for_rerun(tmp_path: Path) -> None:
     assert progress["pending"] == 2
     assert progress["done"] == 0
     assert progress["dropped"] == 0
+
+
+def test_runtime_store_delivery_rows_include_phones(tmp_path: Path) -> None:
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    rows = [ImportedWebsite(input_index=1, raw_website="a.com", website="https://a.com", dedupe_key="a.com")]
+    store.prepare_job(input_name="sites.txt", fingerprint="abc", rows=rows)
+    task = store.claim_next_site()
+
+    assert task is not None
+    store.mark_done(
+        task.id,
+        SiteResult(
+            company_name="A",
+            representative="Alice Smith",
+            emails="a@a.com",
+            website="https://a.com",
+            phones="+49301234567",
+        ),
+    )
+
+    assert store.delivery_rows() == [
+        {
+            "company_name": "A",
+            "representative": "Alice Smith",
+            "emails": "a@a.com",
+            "phones": "+49301234567",
+            "website": "https://a.com",
+        }
+    ]
+    store.close()
 
 
 def test_runtime_store_reuses_connection_in_same_thread(tmp_path: Path) -> None:
@@ -490,6 +609,37 @@ def test_protocol_client_falls_back_to_httpx_on_dns_thread_error() -> None:
     html = client._fetch_html(FakeSession(), "https://example.com", required=True)
 
     assert "httpx fallback ok" in html
+
+
+def test_protocol_client_falls_back_to_httpx_on_tls_connect_error() -> None:
+    class FakeHttpxResponse:
+        def __init__(self, status_code: int, text: str, content_type: str = "text/html") -> None:
+            self.status_code = status_code
+            self.text = text
+            self.headers = {"Content-Type": content_type}
+
+    class FakeHttpxClient:
+        def get(self, url: str, timeout: float):
+            assert url == "https://example.com"
+            assert timeout == 10.0
+            return FakeHttpxResponse(200, "<html>tls httpx fallback ok</html>")
+
+        def close(self) -> None:
+            return None
+
+    class FakeSession:
+        def get(self, url: str, timeout: float):
+            raise RuntimeError(
+                "Failed to perform, curl: (35) TLS connect error: "
+                "error:00000000:invalid library (0):OPENSSL_internal:invalid library (0)"
+            )
+
+    client = SiteProtocolClient(SiteProtocolConfig())
+    client._http_client = FakeHttpxClient()
+
+    html = client._fetch_html(FakeSession(), "https://example.com", required=True)
+
+    assert "tls httpx fallback ok" in html
 
 
 def test_protocol_client_marks_cloudflare_challenge_as_permanent(monkeypatch) -> None:
@@ -829,7 +979,162 @@ def test_protocol_client_default_headers_allow_keepalive() -> None:
     assert "Connection" not in config.default_headers
 
 
-def test_build_site_protocol_config_uses_page_concurrency_for_probe_limits() -> None:
+def test_shell_page_evidence_recovers_0xam_contact_signals() -> None:
+    shell_html = """
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <title>0x Holding | Digital Asset Treasury</title>
+        <meta name="author" content="0x Holding GmbH" />
+        <script type="module" src="/assets/index-xPWHrNF8.js"></script>
+      </head>
+      <body>
+        <div id="root"></div>
+      </body>
+    </html>
+    """
+    asset_text = """
+    const a = "0x Holding GmbH";
+    const b = "Marcel Uhlmann";
+    const c = "Geschäftsführender Gesellschafter";
+    const d = "Geschäftsführer: Marcel Uhlmann";
+    const e = "E-Mail: post@0xam.de";
+    window.location.href = "mailto:m@0xam.de";
+    """
+
+    assert shell_page_module.looks_like_shell_page(shell_html) is True
+    assert shell_page_module.extract_first_party_asset_urls("https://0xam.de/", shell_html) == [
+        "https://0xam.de/assets/index-xPWHrNF8.js"
+    ]
+
+    enriched_html = shell_page_module.build_shell_evidence_html(
+        "https://0xam.de/",
+        shell_html,
+        {"https://0xam.de/assets/index-xPWHrNF8.js": asset_text},
+    )
+    emails, _page_hits = collect_emails_for_pages("https://0xam.de/", [("https://0xam.de/", enriched_html)])
+
+    assert "0x Holding GmbH" in enriched_html
+    assert "Marcel Uhlmann" in enriched_html
+    assert "post@0xam.de" in enriched_html
+    assert "m@0xam.de" in emails
+    assert "post@0xam.de" in emails
+
+
+def test_collect_emails_for_pages_keeps_embedded_same_domain_email_when_offsite_email_is_visible() -> None:
+    html_text = """
+    <html>
+      <body>
+        Contact our vendor at contact@vendor-support.com
+        <script>
+          window.__CONTACT__ = {"email": "info@acmeholdings.co.uk"};
+        </script>
+      </body>
+    </html>
+    """
+
+    emails, _page_hits = collect_emails_for_pages(
+        "https://acmeholdings.co.uk",
+        [("https://acmeholdings.co.uk/privacy", html_text)],
+    )
+
+    assert "info@acmeholdings.co.uk" in emails
+    assert "contact@vendor-support.com" in emails
+
+
+def test_collect_phones_for_pages_keeps_multiple_public_numbers() -> None:
+    html_text = """
+    <html>
+      <body>
+        <a href="tel:+49 (30) 123 4567">Call us</a>
+        <div>Telefon: +49 30 123 4568</div>
+        <script type="application/ld+json">
+          {"telephone": "+49 30 123 4567"}
+        </script>
+      </body>
+    </html>
+    """
+
+    phones, _page_hits = collect_phones_for_pages([("https://atlas.de/impressum", html_text)])
+
+    assert phones == ["+49301234567", "+49301234568"]
+    assert join_phones(phones) == "+49301234567; +49301234568"
+
+
+def test_collect_phones_for_pages_ignores_embedded_numeric_noise() -> None:
+    html_text = """
+    <html>
+      <body>
+        <a href="tel:01858 545147">Call us</a>
+        <script>
+          window.__TRACKING__ = {
+            "pixelId": 100078896527093,
+            "timestamp": 1749478578365,
+            "limit": 2147483647,
+            "duration": 31536000000
+          };
+        </script>
+      </body>
+    </html>
+    """
+
+    phones, _page_hits = collect_phones_for_pages([("https://032designltd.com/contact", html_text)])
+
+    assert phones == ["01858545147"]
+
+
+def test_collect_phones_for_pages_keeps_labeled_and_structured_numbers_only() -> None:
+    html_text = """
+    <html>
+      <body>
+        <div>Phone: +44 20 3983 3310</div>
+        <script type="application/ld+json">
+          {"telephone": "+44 20 3291 1215", "trackingId": "314192535267336"}
+        </script>
+      </body>
+    </html>
+    """
+
+    phones, _page_hits = collect_phones_for_pages([("https://08uk.co.uk/contact", html_text)])
+
+    assert phones == ["+442039833310", "+442032911215"]
+
+
+def test_collect_phones_for_pages_drops_prefixed_extension_variants() -> None:
+    html_text = """
+    <html>
+      <body>
+        <a href="tel:08000141999">Call us</a>
+        <div>Phone: 080001419997</div>
+        <div>Phone: 02086592558</div>
+        <div>Phone: 0208659255810</div>
+      </body>
+    </html>
+    """
+
+    phones, _page_hits = collect_phones_for_pages([("https://example.com/contact", html_text)])
+
+    assert phones == ["08000141999", "02086592558"]
+
+
+def test_select_urls_include_german_impressum_and_kontakt() -> None:
+    urls = [
+        "https://atlas.de/",
+        "https://atlas.de/impressum",
+        "https://atlas.de/kontakt",
+        "https://atlas.de/ueber-uns",
+    ]
+
+    candidates = build_candidates("https://atlas.de/", urls[1:], {}, {})
+    rep_urls, _teacher_pool = select_representative_urls(candidates, target_count=3)
+    email_urls = select_email_urls(candidates)
+
+    assert "https://atlas.de/impressum" in rep_urls
+    assert "https://atlas.de/kontakt" in rep_urls
+    assert "https://atlas.de/kontakt" in email_urls
+
+
+def test_build_site_protocol_config_separates_probe_batch_and_global_worker_limits() -> None:
     config = SimpleNamespace(
         request_timeout_seconds=10.0,
         proxy_url="",
@@ -841,12 +1146,14 @@ def test_build_site_protocol_config_uses_page_concurrency_for_probe_limits() -> 
         cloudflare_proxy_url="",
         total_wait_seconds=180.0,
         page_concurrency=7,
+        page_worker_count=24,
     )
 
     protocol_config = _build_site_protocol_config(config, 123.0)
 
     assert protocol_config.common_probe_concurrency == 7
-    assert protocol_config.request_slot_limit == 7
+    assert protocol_config.probe_worker_count == 24
+    assert protocol_config.request_slot_limit == 24
     assert protocol_config.deadline_monotonic == 123.0
 
 
@@ -1036,6 +1343,243 @@ def test_run_crawl_session_retries_temporary_llm_error_without_restarting_whole_
     assert any(snapshot and snapshot[0]["company_name"] == "Retry Ltd" for snapshot in snapshots)
 
 
+def test_run_crawl_session_batches_delivery_snapshot_writes(tmp_path: Path, monkeypatch) -> None:
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    rows = [
+        ImportedWebsite(input_index=1, raw_website="a.com", website="https://a.com", dedupe_key="a.com"),
+        ImportedWebsite(input_index=2, raw_website="b.com", website="https://b.com", dedupe_key="b.com"),
+        ImportedWebsite(input_index=3, raw_website="c.com", website="https://c.com", dedupe_key="c.com"),
+    ]
+    store.prepare_job(input_name="sites.txt", fingerprint="abc", rows=rows)
+    monkeypatch.setattr(runner_module, "_DELIVERY_FLUSH_EVERY_SITES", 2)
+    monkeypatch.setattr(runner_module, "_DELIVERY_FLUSH_EVERY_SECONDS", 999999.0)
+    monkeypatch.setattr(
+        runner_module,
+        "_run_single_site",
+        lambda _config, _store, _learning_store, _llm_client, _page_pool, task: SimpleNamespace(
+            result=SiteResult(
+                company_name=f"Company {task.id}",
+                representative="Alice Retry",
+                emails=f"site{task.id}@example.com",
+                website=task.website,
+            ),
+            learning_feedback=SimpleNamespace(
+                rep_positive_tokens=[],
+                rep_negative_tokens=[],
+                email_positive_tokens=[],
+                email_negative_tokens=[],
+            ),
+            stage_metrics=SiteStageMetrics(),
+        ),
+    )
+    monkeypatch.setattr(runner_module, "print_site_result", lambda **_kwargs: None)
+    monkeypatch.setattr(runner_module, "print_progress_heartbeat", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        runner_module,
+        "WebsiteLlmClient",
+        lambda **_kwargs: SimpleNamespace(close=lambda: None),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "PageFetchPool",
+        lambda _config: SimpleNamespace(close=lambda: None),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "GlobalLearningStore",
+        lambda _path: SimpleNamespace(
+            close=lambda: None,
+            record_success=lambda *args, **kwargs: None,
+            record_failure=lambda *args, **kwargs: None,
+        ),
+    )
+    write_calls: list[list[dict[str, str]]] = []
+    monkeypatch.setattr(
+        runner_module,
+        "write_delivery_csv",
+        lambda _delivery_path, rows: write_calls.append(list(rows)),
+    )
+
+    config = SimpleNamespace(
+        llm_key="test-key",
+        llm_base_url="https://example.com/v1",
+        llm_model="gpt-5.4-mini",
+        llm_api_style="responses",
+        llm_reasoning_effort="low",
+        proxy_url="",
+        request_timeout_seconds=10.0,
+        llm_concurrency=1,
+        page_worker_count=1,
+        page_host_limit=1,
+        runtime_dir=tmp_path,
+        site_concurrency=1,
+        total_wait_seconds=180.0,
+    )
+
+    runner_module.run_crawl_session(config, store, tmp_path / "delivery.csv")
+
+    assert len(write_calls) == 2
+    assert len(write_calls[0]) == 2
+    assert len(write_calls[1]) == 3
+
+
+def test_run_crawl_session_ignores_final_delivery_write_permission_error(tmp_path: Path, monkeypatch, capsys) -> None:
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    rows = [
+        ImportedWebsite(input_index=1, raw_website="a.com", website="https://a.com", dedupe_key="a.com"),
+    ]
+    store.prepare_job(input_name="sites.txt", fingerprint="abc", rows=rows)
+
+    monkeypatch.setattr(
+        runner_module,
+        "_run_single_site",
+        lambda _config, _store, _learning_store, _llm_client, _page_pool, _task: SimpleNamespace(
+            result=SiteResult(
+                company_name="Retry Ltd",
+                representative="Alice Retry",
+                emails="retry@example.com",
+                website="https://a.com",
+            ),
+            learning_feedback=SimpleNamespace(
+                rep_positive_tokens=[],
+                rep_negative_tokens=[],
+                email_positive_tokens=[],
+                email_negative_tokens=[],
+            ),
+            stage_metrics=SiteStageMetrics(),
+        ),
+    )
+    monkeypatch.setattr(runner_module, "print_site_result", lambda **_kwargs: None)
+    monkeypatch.setattr(runner_module, "print_progress_heartbeat", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        runner_module,
+        "WebsiteLlmClient",
+        lambda **_kwargs: SimpleNamespace(close=lambda: None),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "PageFetchPool",
+        lambda _config: SimpleNamespace(close=lambda: None),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "GlobalLearningStore",
+        lambda _path: SimpleNamespace(
+            close=lambda: None,
+            record_success=lambda *args, **kwargs: None,
+            record_failure=lambda *args, **kwargs: None,
+        ),
+    )
+
+    write_calls = {"count": 0}
+
+    def flaky_write(_delivery_path, _rows) -> None:
+        write_calls["count"] += 1
+        raise PermissionError("delivery locked")
+
+    monkeypatch.setattr(runner_module, "write_delivery_csv", flaky_write)
+
+    config = SimpleNamespace(
+        llm_key="test-key",
+        llm_base_url="https://example.com/v1",
+        llm_model="gpt-5.4-mini",
+        llm_api_style="responses",
+        llm_reasoning_effort="low",
+        proxy_url="",
+        request_timeout_seconds=10.0,
+        llm_concurrency=1,
+        page_worker_count=1,
+        page_host_limit=1,
+        runtime_dir=tmp_path,
+        site_concurrency=1,
+        total_wait_seconds=180.0,
+    )
+
+    runner_module.run_crawl_session(config, store, tmp_path / "delivery.csv")
+
+    assert write_calls["count"] == 1
+    assert "写入交付文件失败" in capsys.readouterr().out
+
+
+def test_run_crawl_session_retries_delivery_write_after_transient_error(tmp_path: Path, monkeypatch) -> None:
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    rows = [
+        ImportedWebsite(input_index=1, raw_website="a.com", website="https://a.com", dedupe_key="a.com"),
+        ImportedWebsite(input_index=2, raw_website="b.com", website="https://b.com", dedupe_key="b.com"),
+    ]
+    store.prepare_job(input_name="sites.txt", fingerprint="abc", rows=rows)
+    monkeypatch.setattr(runner_module, "_DELIVERY_FLUSH_EVERY_SITES", 1)
+    monkeypatch.setattr(runner_module, "_DELIVERY_FLUSH_EVERY_SECONDS", 999999.0)
+    monkeypatch.setattr(
+        runner_module,
+        "_run_single_site",
+        lambda _config, _store, _learning_store, _llm_client, _page_pool, task: SimpleNamespace(
+            result=SiteResult(
+                company_name=f"Company {task.id}",
+                representative="Alice Retry",
+                emails=f"site{task.id}@example.com",
+                website=task.website,
+            ),
+            learning_feedback=SimpleNamespace(
+                rep_positive_tokens=[],
+                rep_negative_tokens=[],
+                email_positive_tokens=[],
+                email_negative_tokens=[],
+            ),
+            stage_metrics=SiteStageMetrics(),
+        ),
+    )
+    monkeypatch.setattr(runner_module, "print_site_result", lambda **_kwargs: None)
+    monkeypatch.setattr(runner_module, "print_progress_heartbeat", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        runner_module,
+        "WebsiteLlmClient",
+        lambda **_kwargs: SimpleNamespace(close=lambda: None),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "PageFetchPool",
+        lambda _config: SimpleNamespace(close=lambda: None),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "GlobalLearningStore",
+        lambda _path: SimpleNamespace(
+            close=lambda: None,
+            record_success=lambda *args, **kwargs: None,
+            record_failure=lambda *args, **kwargs: None,
+        ),
+    )
+    write_calls: list[int] = []
+
+    def flaky_then_ok(_delivery_path, rows) -> None:
+        write_calls.append(len(rows))
+        if len(write_calls) == 1:
+            raise PermissionError("delivery locked")
+
+    monkeypatch.setattr(runner_module, "write_delivery_csv", flaky_then_ok)
+
+    config = SimpleNamespace(
+        llm_key="test-key",
+        llm_base_url="https://example.com/v1",
+        llm_model="gpt-5.4-mini",
+        llm_api_style="responses",
+        llm_reasoning_effort="low",
+        proxy_url="",
+        request_timeout_seconds=10.0,
+        llm_concurrency=1,
+        page_worker_count=1,
+        page_host_limit=1,
+        runtime_dir=tmp_path,
+        site_concurrency=1,
+        total_wait_seconds=180.0,
+    )
+
+    runner_module.run_crawl_session(config, store, tmp_path / "delivery.csv")
+
+    assert write_calls == [1, 2]
+
+
 def test_run_crawl_session_persists_other_done_futures_before_raising_llm_error(tmp_path: Path, monkeypatch) -> None:
     success_result = SimpleNamespace(
         result=SiteResult(
@@ -1166,6 +1710,154 @@ def test_run_crawl_session_persists_other_done_futures_before_raising_llm_error(
     assert pending_future.cancelled is True
 
 
+def test_run_crawl_session_returns_quickly_after_fatal_llm_error(tmp_path: Path, monkeypatch) -> None:
+    slow_done = __import__("threading").Event()
+
+    class FastAbortStore:
+        def __init__(self) -> None:
+            self._claim_count = 0
+
+        def progress(self) -> dict[str, int]:
+            return {
+                "total": 2,
+                "done": 0,
+                "running": 0,
+                "dropped": 0,
+                "pending": 2,
+                "failed_temp": 0,
+            }
+
+        def claim_next_site(self):
+            self._claim_count += 1
+            if self._claim_count == 1:
+                return SimpleNamespace(id=1, input_index=1, website="https://fatal.example.com", dedupe_key="fatal", retry_count=0)
+            if self._claim_count == 2:
+                return SimpleNamespace(id=2, input_index=2, website="https://slow.example.com", dedupe_key="slow", retry_count=0)
+            return None
+
+        def delivery_rows(self) -> list[dict[str, str]]:
+            return []
+
+    class Closable:
+        def close(self) -> None:
+            return None
+
+    def fake_run_single_site(_config, _store, _learning_store, _llm_client, _page_pool, task):
+        if task.id == 1:
+            time.sleep(0.05)
+            raise LlmConfigurationError("invalid_api_key")
+        try:
+            time.sleep(1.0)
+            return SimpleNamespace(
+                result=SiteResult(
+                    company_name="Late Ltd",
+                    representative="Late Runner",
+                    emails="late@example.com",
+                    website="https://slow.example.com",
+                ),
+                learning_feedback=SimpleNamespace(
+                    rep_positive_tokens=[],
+                    rep_negative_tokens=[],
+                    email_positive_tokens=[],
+                    email_negative_tokens=[],
+                ),
+                stage_metrics=SiteStageMetrics(),
+            )
+        finally:
+            slow_done.set()
+
+    monkeypatch.setattr(runner_module, "_run_single_site", fake_run_single_site)
+    monkeypatch.setattr(runner_module, "WebsiteLlmClient", lambda **_kwargs: Closable())
+    monkeypatch.setattr(runner_module, "PageFetchPool", lambda _config: Closable())
+    monkeypatch.setattr(
+        runner_module,
+        "GlobalLearningStore",
+        lambda _path: SimpleNamespace(
+            close=lambda: None,
+            record_success=lambda *args, **kwargs: None,
+            record_failure=lambda *args, **kwargs: None,
+        ),
+    )
+    monkeypatch.setattr(runner_module, "print_site_result", lambda **_kwargs: None)
+    monkeypatch.setattr(runner_module, "print_progress_heartbeat", lambda **_kwargs: None)
+    monkeypatch.setattr(runner_module, "write_delivery_csv", lambda _delivery_path, _rows: None)
+
+    config = SimpleNamespace(
+        llm_key="test-key",
+        llm_base_url="https://example.com/v1",
+        llm_model="gpt-5.4-mini",
+        llm_api_style="responses",
+        llm_reasoning_effort="low",
+        proxy_url="",
+        request_timeout_seconds=10.0,
+        llm_concurrency=1,
+        page_worker_count=1,
+        page_host_limit=1,
+        runtime_dir=tmp_path,
+        site_concurrency=2,
+        total_wait_seconds=180.0,
+    )
+
+    started = time.monotonic()
+    with pytest.raises(LlmConfigurationError):
+        runner_module.run_crawl_session(config, FastAbortStore(), tmp_path / "delivery.csv")
+    elapsed = time.monotonic() - started
+    slow_done.wait(2.0)
+
+    assert elapsed < 0.5
+
+
+def test_run_single_site_treats_site_deadline_exceeded_as_permanent(monkeypatch) -> None:
+    class FakeService:
+        def __init__(self, *_args, **_kwargs) -> None:
+            return None
+
+        def process(self, *_args, **_kwargs):
+            raise TimeoutError("site_deadline_exceeded")
+
+    monkeypatch.setattr(runner_module, "SiteProfileService", FakeService)
+
+    with pytest.raises(ProtocolPermanentError, match="site_deadline_exceeded"):
+        runner_module._run_single_site(
+            SimpleNamespace(total_wait_seconds=180.0),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(id=1, website="https://example.com"),
+        )
+
+
+def test_handle_future_retries_site_deadline_without_fetched_pages(tmp_path: Path, monkeypatch) -> None:
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    rows = [ImportedWebsite(input_index=1, raw_website="a.com", website="https://a.com", dedupe_key="a.com")]
+    store.prepare_job(input_name="sites.txt", fingerprint="abc", rows=rows)
+    task = store.claim_next_site()
+
+    assert task is not None
+    future = Future()
+    future.set_exception(ProtocolPermanentError("site_deadline_exceeded"))
+    monkeypatch.setattr(runner_module, "print_site_result", lambda **_kwargs: None)
+
+    completed = runner_module._handle_future(
+        future,
+        task,
+        total=1,
+        completed_count=0,
+        store=store,
+        learning_store=SimpleNamespace(
+            record_success=lambda *args, **kwargs: None,
+            record_failure=lambda *args, **kwargs: None,
+        ),
+        delivery_writer=SimpleNamespace(note_completion=lambda: None),
+    )
+
+    assert completed == 0
+    progress = store.progress()
+    assert progress["failed_temp"] == 1
+    assert progress["dropped"] == 0
+
+
 def test_normalize_llm_result_accepts_canonical_evidence_url() -> None:
     result = _normalize_llm_result(
         LlmExtractionResult(
@@ -1183,10 +1875,10 @@ def test_normalize_llm_result_accepts_canonical_evidence_url() -> None:
 
 def test_missing_reason_describes_empty_fields() -> None:
     reason = _describe_missing_reason(
-        SiteResult(company_name="", representative="", emails="", website="https://example.com")
+        SiteResult(company_name="", representative="", emails="", website="https://example.com", phones="")
     )
 
-    assert reason == "官网页面里未识别到明确公司名；官网页面里未识别到负责人姓名；价值页里未命中有效邮箱"
+    assert reason == "官网页面里未识别到明确公司名；官网页面里未识别到负责人姓名；价值页里未命中有效邮箱；价值页里未命中有效电话"
 
 
 def test_normalize_representative_name_allows_single_name_but_rejects_role_word() -> None:
@@ -1202,7 +1894,7 @@ def test_error_reason_maps_http_and_dns_thread_errors() -> None:
     assert _describe_error_reason("[Errno 35] Resource temporarily unavailable") == "本地高并发网络资源暂时不足，当前请求未成功"
     assert _describe_error_reason("curl: (7) Failed to connect to host: Couldn't connect to server") == "站点当前明显无法连通，已直接停止重试"
     assert _describe_error_reason("imperva_challenge: https://example.com") == "站点被 Imperva/Incapsula 风控挑战页拦截，协议抓取当前拿不到真实正文"
-    assert _describe_error_reason("site_deadline_exceeded") == "单站已达到 180 秒时间上限，当前直接停止，不再重试"
+    assert _describe_error_reason("site_deadline_exceeded") == "单站已达到时间上限，本轮没有拿到足够结果"
 
 
 def test_temporary_error_detection_includes_resource_temporarily_unavailable() -> None:
@@ -1521,7 +2213,7 @@ def test_protocol_discovery_probes_common_value_paths_when_homepage_is_blocked(m
     client.close()
 
 
-def test_protocol_discovery_keeps_challenged_common_value_paths(monkeypatch) -> None:
+def test_protocol_discovery_drops_challenged_common_value_paths(monkeypatch) -> None:
     client = SiteProtocolClient(SiteProtocolConfig())
 
     def fake_fetch_html(_session, url: str, *, required: bool, timeout_seconds=None, max_retries_override=None) -> str:
@@ -1536,7 +2228,7 @@ def test_protocol_discovery_keeps_challenged_common_value_paths(monkeypatch) -> 
 
     urls, _homepage_html = client._discover_direct_urls(object(), "https://example.com", limit=20)
 
-    assert "https://example.com/executive-team" in urls
+    assert "https://example.com/executive-team" not in urls
     client.close()
 
 
@@ -1611,6 +2303,67 @@ def test_company_name_fallback_prefers_site_name_and_strips_welcome_prefix() -> 
 
     assert company == "Corse Lawn House Hotel"
 
+
+def test_company_name_fallback_rejects_directory_listing_titles() -> None:
+    html_text = """
+    <html>
+      <head>
+        <title>Index of locally available sites:</title>
+      </head>
+      <body>
+        <h1>Index of locally available sites:</h1>
+      </body>
+    </html>
+    """
+
+    company = extract_company_name_fallback(
+        "https://11235ltd.com",
+        [("https://11235ltd.com", html_text)],
+    )
+
+    assert company == ""
+
+
+def test_company_name_fallback_rejects_challenge_titles() -> None:
+    html_text = """
+    <html>
+      <head>
+        <title>Hold tight</title>
+      </head>
+      <body>
+        <h1>Hold tight</h1>
+      </body>
+    </html>
+    """
+
+    company = extract_company_name_fallback(
+        "https://ato24.de",
+        [("https://ato24.de", html_text)],
+    )
+
+    assert company == ""
+
+
+def test_company_name_fallback_rejects_local_index_titles() -> None:
+    html_text = """
+    <html>
+      <head>
+        <title>Local index</title>
+      </head>
+      <body>
+        <h1>Local index</h1>
+      </body>
+    </html>
+    """
+
+    company = extract_company_name_fallback(
+        "https://11235ltd.com",
+        [("https://11235ltd.com", html_text)],
+    )
+
+    assert company == ""
+
+
 def test_detect_challenge_kind_supports_imperva_pages() -> None:
     html_text = '<html><body><iframe src=\"/_Incapsula_Resource?abc=1\"></iframe>Request unsuccessful. Incapsula incident ID: 123</body></html>'
 
@@ -1620,6 +2373,12 @@ def test_detect_challenge_kind_supports_imperva_pages() -> None:
 def test_supported_url_rejects_template_placeholders() -> None:
     assert protocol_module._is_supported_url("https://example.com/about-us/{{{data.link}}}") is False
     assert protocol_module._is_supported_url("https://example.com/about-us/itemDataObject.url") is False
+
+
+def test_supported_url_rejects_system_login_and_challenge_paths() -> None:
+    assert protocol_module._is_supported_url("https://example.com/wp-login.php?action=lostpassword") is False
+    assert protocol_module._is_supported_url("https://example.com/cdn-cgi/l/email-protection") is False
+    assert protocol_module._is_supported_url("https://example.com/.well-known/sgcaptcha/?r=%2F") is False
 
 
 def test_truncate_html_keeps_middle_representative_signal() -> None:
@@ -1777,7 +2536,7 @@ def test_solve_cloudflare_challenge_polls_until_ready(monkeypatch) -> None:
         def close(self) -> None:
             return None
 
-    monkeypatch.setattr(challenge_module, "_build_http_client", lambda _proxy: FakeClient())
+    monkeypatch.setattr(challenge_module, "_build_http_client", lambda *_args, **_kwargs: FakeClient())
 
     result = challenge_module.solve_cloudflare_challenge(
         api_key="capsolver-key",
@@ -1820,7 +2579,7 @@ def test_resolve_cloudflare_challenge_prefers_cloudflare_proxy(monkeypatch) -> N
         max_html_chars=250000,
         session_headers={"User-Agent": "UA-1"},
         cookie_jar=None,
-        detect_challenge=lambda value: "cloudflare" in value.lower(),
+        detect_challenge_kind=lambda value: "cloudflare_challenge" if "cloudflare" in value.lower() else "",
         refetch_html=lambda: "",
         impersonate="chrome110",
         capsolver_api_key="capsolver-key",

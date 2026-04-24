@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,8 +17,9 @@ if str(SRC_DIR) not in sys.path:
 
 from oldironcrawler.bootstrap import raise_nofile_soft_limit, resolve_runtime_root
 from oldironcrawler.package_layout import build_portable_dist_folder
-from oldironcrawler.config import AppConfig
+from oldironcrawler.config import AppConfig, persist_llm_key
 from oldironcrawler.console import prompt_runtime_llm_key, wait_for_llm_retry_confirmation
+from oldironcrawler.app import _apply_runtime_preferences, _build_artifact_stem, _derive_runtime_concurrency_budget
 import oldironcrawler.package_layout as package_layout
 
 
@@ -70,6 +72,7 @@ def test_packaging_targets_portable_folder_layout(tmp_path: Path) -> None:
                 "LLM_KEY=env-secret",
                 "LLM_API_KEY=env-api-secret",
                 "LLM_MODEL=gpt-5.4-mini",
+                "PROXY_URL=http://127.0.0.1:7897",
                 "CAPSOLVER_API_KEY=capsolver-secret",
                 "CAPSOLVER_PROXY=http://secret-proxy.local:9000",
                 "CLOUDFLARE_PROXY_URL=http://cloudflare-proxy.local:7000",
@@ -92,14 +95,47 @@ def test_packaging_targets_portable_folder_layout(tmp_path: Path) -> None:
     assert "LLM_API_KEY=" in packaged_env
     assert "env-secret" not in packaged_env
     assert "env-api-secret" not in packaged_env
-    assert "CAPSOLVER_API_KEY" not in packaged_env
-    assert "CAPSOLVER_PROXY" not in packaged_env
-    assert "CLOUDFLARE_PROXY_URL" not in packaged_env
-    assert "LLM_CONCURRENCY=32" in packaged_env
+    assert "PROXY_URL=http://127.0.0.1:7897" in packaged_env
+    assert "CAPSOLVER_API_KEY=capsolver-secret" in packaged_env
+    assert "CAPSOLVER_PROXY=http://secret-proxy.local:9000" in packaged_env
+    assert "CLOUDFLARE_PROXY_URL=http://cloudflare-proxy.local:7000" in packaged_env
+    assert "LLM_CONCURRENCY=4" in packaged_env
+    assert "PAGE_CONCURRENCY=32" not in packaged_env
+    assert "PAGE_WORKER_COUNT=32" not in packaged_env
+    assert "PAGE_HOST_LIMIT=32" not in packaged_env
     assert (package_root / "websites").is_dir()
     assert (package_root / "websites" / "把 Excel 网站表放到这里.md").exists()
     assert (package_root / "output").is_dir()
     assert (package_root / "output" / "runtime").is_dir()
+
+
+def test_derive_runtime_concurrency_budget_keeps_site_concurrency_high() -> None:
+    budget = _derive_runtime_concurrency_budget(64)
+
+    assert budget.site_concurrency == 64
+    assert budget.llm_concurrency == 12
+    assert budget.page_concurrency == 12
+    assert budget.page_worker_count == 32
+    assert budget.page_host_limit == 4
+
+
+def test_apply_runtime_preferences_shapes_internal_limits_without_lowering_site_concurrency() -> None:
+    config = SimpleNamespace(
+        llm_concurrency=1,
+        site_concurrency=1,
+        page_concurrency=1,
+        page_worker_count=1,
+        page_host_limit=1,
+        total_wait_seconds=180.0,
+    )
+
+    _apply_runtime_preferences(config, concurrency=64, site_timeout_seconds=180)
+
+    assert config.site_concurrency == 64
+    assert config.llm_concurrency == 12
+    assert config.page_worker_count == 32
+    assert config.page_concurrency == 12
+    assert config.page_host_limit == 4
 
 
 def test_packaging_raises_when_existing_directory_is_not_writable(tmp_path: Path, monkeypatch) -> None:
@@ -188,7 +224,7 @@ def test_app_config_prefers_runtime_llm_key_override(tmp_path: Path) -> None:
     assert config.llm_key == "runtime-key"
 
 
-def test_app_config_prefers_dotenv_values_over_process_environment(tmp_path: Path, monkeypatch) -> None:
+def test_app_config_prefers_process_environment_over_dotenv_values(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / ".env").write_text(
         "\n".join(
             [
@@ -205,9 +241,80 @@ def test_app_config_prefers_dotenv_values_over_process_environment(tmp_path: Pat
 
     config = AppConfig.load(tmp_path)
 
-    assert config.llm_base_url == "https://dotenv.example/v1"
-    assert config.llm_key == "dotenv-key"
-    assert config.llm_model == "dotenv-model"
+    assert config.llm_base_url == "https://env.example/v1"
+    assert config.llm_key == "env-key"
+    assert config.llm_model == "env-model"
+
+
+def test_app_config_does_not_auto_enable_local_proxy_when_proxy_url_is_missing(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "LLM_BASE_URL=https://dotenv.example/v1",
+                "LLM_KEY=dotenv-key",
+                "LLM_MODEL=dotenv-model",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("oldironcrawler.config._local_proxy_is_ready", lambda _proxy_url: True)
+
+    config = AppConfig.load(tmp_path)
+
+    assert config.proxy_url == ""
+
+
+def test_app_config_keeps_explicit_proxy_url_when_local_proxy_is_ready(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "LLM_BASE_URL=https://dotenv.example/v1",
+                "LLM_KEY=dotenv-key",
+                "LLM_MODEL=dotenv-model",
+                "PROXY_URL=http://127.0.0.1:7897",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("oldironcrawler.config._local_proxy_is_ready", lambda _proxy_url: True)
+
+    config = AppConfig.load(tmp_path)
+
+    assert config.proxy_url == "http://127.0.0.1:7897"
+
+
+def test_app_config_discards_invalid_local_proxy_port(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "LLM_BASE_URL=https://dotenv.example/v1",
+                "LLM_KEY=dotenv-key",
+                "LLM_MODEL=dotenv-model",
+                "PROXY_URL=http://127.0.0.1:not-a-port",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = AppConfig.load(tmp_path)
+
+    assert config.proxy_url == ""
+
+
+def test_persist_llm_key_strips_newlines(tmp_path: Path) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text("LLM_KEY=\nLLM_API_KEY=\n", encoding="utf-8")
+
+    persist_llm_key(tmp_path, "good-key\nPROXY_URL=http://evil")
+    env_text = env_path.read_text(encoding="utf-8")
+
+    assert "LLM_KEY=good-keyPROXY_URL=http://evil" in env_text
+    assert "\nPROXY_URL=http://evil\n" not in env_text
+
+
+def test_build_artifact_stem_separates_suffixes() -> None:
+    assert _build_artifact_stem(Path("clients.csv")) == "clients-csv"
+    assert _build_artifact_stem(Path("clients.xlsx")) == "clients-xlsx"
 
 
 def test_app_config_falls_back_when_default_websites_dir_is_denied(tmp_path: Path, monkeypatch) -> None:

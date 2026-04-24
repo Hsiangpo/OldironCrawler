@@ -112,7 +112,7 @@ def solve_cloudflare_challenge(
 ) -> CapSolverResult | None:
     if not str(api_key or "").strip() or not str(proxy or "").strip():
         return None
-    client = _build_http_client(api_proxy_url)
+    client = _build_http_client(api_proxy_url, timeout_seconds=max_wait_seconds)
     try:
         task_id = _create_capsolver_task(
             client=client,
@@ -150,7 +150,7 @@ def resolve_cloudflare_challenge(
     max_html_chars: int,
     session_headers: dict[str, str],
     cookie_jar: Any,
-    detect_challenge: Callable[[str], bool],
+    detect_challenge_kind: Callable[[str], str],
     refetch_html: Callable[[], str],
     impersonate: str,
     capsolver_api_key: str,
@@ -159,7 +159,8 @@ def resolve_cloudflare_challenge(
     capsolver_poll_seconds: float,
     capsolver_max_wait_seconds: float,
 ) -> str:
-    if not detect_challenge(html_text):
+    initial_kind = str(detect_challenge_kind(html_text) or "").strip()
+    if initial_kind != "cloudflare_challenge":
         return html_text
     challenge_proxy_url = _pick_challenge_proxy_url(cloudflare_proxy_url, proxy_url)
     challenge_html = _run_cloudscraper_fallback(
@@ -171,7 +172,7 @@ def resolve_cloudflare_challenge(
         cookie_jar=cookie_jar,
         max_html_chars=max_html_chars,
     )
-    if not detect_challenge(challenge_html):
+    if not str(detect_challenge_kind(challenge_html) or "").strip():
         return challenge_html
     solved_html = _run_capsolver_fallback(
         url=url,
@@ -275,8 +276,11 @@ def _poll_capsolver_result(
     poll_seconds: float,
     max_wait_seconds: float,
 ) -> CapSolverResult | None:
-    elapsed = 0.0
-    while elapsed <= max_wait_seconds:
+    deadline = time.monotonic() + max(max_wait_seconds, 0.0)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
         response = client.post(
             f"{api_base_url.rstrip('/')}/getTaskResult",
             json={"clientKey": api_key, "taskId": task_id},
@@ -307,14 +311,12 @@ def _poll_capsolver_result(
             )
         if status not in {"idle", "processing"}:
             return None
-        time.sleep(poll_seconds)
-        elapsed += poll_seconds
-    return None
+        time.sleep(min(poll_seconds, max(remaining, 0.0)))
 
 
-def _build_http_client(api_proxy_url: str) -> httpx.Client:
+def _build_http_client(api_proxy_url: str, timeout_seconds: float) -> httpx.Client:
     kwargs: dict[str, Any] = {
-        "timeout": 30.0,
+        "timeout": max(min(float(timeout_seconds or 0.0), 30.0), 5.0),
         "follow_redirects": True,
         "trust_env": False,
     }
@@ -356,7 +358,7 @@ def _run_cloudscraper_fallback(
         headers=headers,
         cookies=export_cookie_records(cookie_jar),
     )
-    if result is None or not str(result.html or "").strip():
+    if result is None or int(result.status_code or 0) != 200 or not str(result.html or "").strip():
         return html_text
     if cookie_jar is not None and result.cookies:
         apply_cookie_records(cookie_jar, result.cookies)
@@ -403,7 +405,7 @@ def _run_capsolver_fallback(
         apply_cookie_records(cookie_jar, result.cookies)
     time.sleep(1.0)
     if challenge_proxy_url:
-        return _refetch_with_temp_proxy(
+        solved_html = _refetch_with_temp_proxy(
             url=url,
             timeout_seconds=timeout_seconds,
             proxy_url=challenge_proxy_url,
@@ -412,7 +414,12 @@ def _run_capsolver_fallback(
             cookie_jar=cookie_jar,
             max_html_chars=max_html_chars,
         )
-    return refetch_html()
+        if solved_html:
+            return solved_html
+    solved_html = refetch_html()
+    if solved_html:
+        return solved_html
+    raise RuntimeError("challenge_refetch_failed")
 
 
 def _pick_challenge_proxy_url(cloudflare_proxy_url: str, proxy_url: str) -> str:
@@ -438,6 +445,8 @@ def _refetch_with_temp_proxy(
         if cookie_jar is not None:
             apply_cookie_records(session.cookies, export_cookie_records(cookie_jar))
         response = session.get(url, timeout=timeout_seconds)
+        if int(getattr(response, "status_code", 0) or 0) != 200:
+            return ""
         if cookie_jar is not None:
             apply_cookie_records(cookie_jar, export_cookie_records(session.cookies))
         return str(getattr(response, "text", "") or "")[:max_html_chars]

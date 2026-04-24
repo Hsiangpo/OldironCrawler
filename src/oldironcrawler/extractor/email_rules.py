@@ -47,11 +47,11 @@ _IGNORE_LOCAL_PARTS = {
     "youremail", "email", "noreply", "no-reply", "donotreply", "do-not-reply",
 }
 _PLACEHOLDER_EXACT_PARTS = {
-    "aaa", "aaaa", "dummy", "example", "hogehoge", "hoge", "name", "sample",
+    "aaa", "aaaa", "beispiel", "dummy", "example", "hogehoge", "hoge", "name", "sample",
     "test", "xxx", "xxxx", "xxxxx", "yourdomain", "yourdmain",
 }
-_PLACEHOLDER_DOMAIN_WORDS = {"aaa", "dummy", "email", "example", "sample", "test", "yourdomain", "yourdmain"}
-_PLACEHOLDER_STEM_WORDS = {"dummy", "email", "example", "name", "sample", "test"}
+_PLACEHOLDER_DOMAIN_WORDS = {"aaa", "beispiel", "dummy", "email", "example", "sample", "test", "yourdomain", "yourdmain"}
+_PLACEHOLDER_STEM_WORDS = {"beispiel", "dummy", "email", "example", "name", "sample", "test"}
 _EMAIL_PRIORITY_LOCAL_PARTS = {
     "contact", "customer", "hello", "help", "hr", "info", "inquiry", "office",
     "privacy", "pr", "press", "recruit", "recruiting", "sales", "service",
@@ -235,8 +235,10 @@ def collect_emails_for_pages(website: str, pages: list[tuple[str, str]]) -> tupl
     page_hits: dict[str, list[str]] = {}
     for url, html_text in pages:
         page_emails = extract_emails_from_html(html_text)
-        if not page_emails:
-            page_emails = extract_same_domain_emails_from_embedded_content(website, html_text)
+        embedded_same_domain = extract_same_domain_emails_from_embedded_content(website, html_text)
+        for email in embedded_same_domain:
+            if email not in page_emails:
+                page_emails.append(email)
         analysis = analyze_email_set(website, page_emails)
         if analysis.suspicious_directory_like:
             if analysis.same_domain_emails:

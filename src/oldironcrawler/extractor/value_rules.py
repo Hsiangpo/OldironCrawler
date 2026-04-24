@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from urllib.parse import unquote, urlparse
 
@@ -9,9 +10,12 @@ _REP_WEIGHTS = {
     "about": 10,
     "contact": 9,
     "company": 10,
+    "kontakt": 18,
     "leadership": 16,
     "chairman": 14,
     "chief": 14,
+    "geschaftsfuhrer": 18,
+    "geschaeftsfuehrer": 18,
     "impressum": 14,
     "imprint": 14,
     "team": 12,
@@ -32,11 +36,15 @@ _REP_WEIGHTS = {
     "referral": 8,
     "referrals": 8,
     "solicitor": 10,
+    "uber": 10,
+    "ueber": 10,
 }
 _EMAIL_WEIGHTS = {
     "contact": 20,
+    "kontakt": 22,
     "driver": 10,
     "drive": 8,
+    "datenschutz": 12,
     "impressum": 10,
     "imprint": 10,
     "jobs": 8,
@@ -118,6 +126,7 @@ _REP_SOURCE_STRONG_TOKENS = {
     "contact",
     "impressum",
     "imprint",
+    "kontakt",
     "leadership",
     "team",
     "leadership",
@@ -131,6 +140,8 @@ _REP_SOURCE_STRONG_TOKENS = {
     "president",
     "owner",
     "founder",
+    "uber",
+    "ueber",
 }
 _PERSON_DETAIL_CONTEXT_TOKENS = {
     "about",
@@ -155,6 +166,7 @@ _PERSON_DETAIL_CONTEXT_TOKENS = {
     "referrals",
     "solicitor",
     "team",
+    "kontakt",
 }
 _PERSON_DETAIL_NON_NAME_TOKENS = _PERSON_DETAIL_CONTEXT_TOKENS | {
     "and",
@@ -469,7 +481,11 @@ def _expand_composite_token(token: str) -> list[str]:
     expanded = _COMPOSITE_TOKEN_MAP.get(clean)
     if expanded:
         return expanded
-    return [clean]
+    ascii_variant = unicodedata.normalize("NFKD", clean).encode("ascii", "ignore").decode("ascii")
+    values = [clean]
+    if ascii_variant and ascii_variant != clean:
+        values.append(ascii_variant)
+    return values
 
 
 def _family_key(tokens: list[str]) -> str:
@@ -569,11 +585,17 @@ def _path_phrase_bonus(url: str, *, kind: str) -> int:
             ("about-us", 8),
             ("company-leadership", 18),
             ("executive-team", 18),
+            ("geschaeftsfuehrer", 18),
+            ("geschaftsfuhrer", 18),
+            ("impressum", 20),
+            ("kontakt", 18),
             ("leadership-team", 18),
             ("management-team", 16),
             ("our-people", 18),
             ("our-team", 12),
             ("team-members", 16),
+            ("ueber-uns", 16),
+            ("uber-uns", 16),
             ("executive-team", 18),
         ):
             if phrase in lowered:
@@ -582,6 +604,9 @@ def _path_phrase_bonus(url: str, *, kind: str) -> int:
         for phrase, value in (
             ("contact-us", 14),
             ("contact/", 6),
+            ("datenschutz", 10),
+            ("impressum", 12),
+            ("kontakt", 18),
             ("privacy-policy", 6),
         ):
             if phrase in lowered:

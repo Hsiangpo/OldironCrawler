@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import socket
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -40,7 +41,10 @@ def _local_proxy_is_ready(proxy_url: str) -> bool:
     if "127.0.0.1:" not in text and "localhost:" not in text:
         return True
     host = "127.0.0.1" if "127.0.0.1:" in text else "localhost"
-    port = int(text.rsplit(":", 1)[-1].split("/", 1)[0])
+    try:
+        port = int(text.rsplit(":", 1)[-1].split("/", 1)[0])
+    except ValueError:
+        return False
     try:
         with socket.create_connection((host, port), timeout=0.5):
             return True
@@ -52,17 +56,22 @@ def _resolve_proxy_url(values: Mapping[str, str]) -> str:
     explicit = _config_str(values, "PROXY_URL")
     if explicit:
         return explicit if _local_proxy_is_ready(explicit) else ""
-    fallback = "http://127.0.0.1:7897"
-    return fallback if _local_proxy_is_ready(fallback) else ""
+    return ""
 
 
 def _load_config_values(project_root: Path) -> dict[str, str]:
-    values = dotenv_values(project_root / ".env")
-    return {
+    file_values = dotenv_values(project_root / ".env")
+    values = {
         str(name): str(value)
-        for name, value in values.items()
+        for name, value in file_values.items()
         if name and value is not None
     }
+    for name, value in os.environ.items():
+        key = str(name or "").strip()
+        if not key or value is None:
+            continue
+        values[key] = str(value)
+    return values
 
 
 def resolve_websites_dir(project_root: Path) -> Path:
@@ -91,7 +100,7 @@ def read_saved_llm_key(project_root: Path) -> str:
 def persist_llm_key(project_root: Path, llm_key: str) -> None:
     env_path = project_root / ".env"
     lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
-    saved_key = str(llm_key or "").strip()
+    saved_key = _sanitize_env_value(llm_key)
     updated: list[str] = []
     seen_key = False
     seen_api_key = False
@@ -111,6 +120,10 @@ def persist_llm_key(project_root: Path, llm_key: str) -> None:
     if not seen_api_key:
         updated.append(f"LLM_API_KEY={saved_key}")
     env_path.write_text("\n".join(updated).rstrip() + "\n", encoding="utf-8")
+
+
+def _sanitize_env_value(value: object) -> str:
+    return str(value or "").replace("\r", "").replace("\n", "").strip()
 
 
 @dataclass

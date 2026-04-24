@@ -148,7 +148,9 @@ class WebsiteLlmClient:
             return None
 
     def ping(self) -> None:
-        self._call_json('只返回 JSON：{"ok":true}')
+        payload = self._call_json('只返回 JSON：{"ok":true}')
+        if payload.get("ok") is not True:
+            raise RuntimeError("llm_ping_invalid_response")
 
     def pick_website_column(
         self,
