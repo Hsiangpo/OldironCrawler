@@ -2,11 +2,25 @@ from __future__ import annotations
 
 import os
 import socket
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import dotenv_values
+
+
+_PACKAGED_IGNORED_ENV_KEYS = {
+    "LLM_KEY",
+    "LLM_API_KEY",
+    "LLM_BASE_URL",
+    "LLM_BASE_URLS",
+    "LLM_TLS_VERIFY",
+    "CAPSOLVER_API_KEY",
+    "CAPSOLVER_PROXY",
+    "CLOUDFLARE_PROXY_URL",
+    "PROXY_URL",
+}
 
 
 def _config_str(values: Mapping[str, str], name: str, default: str = "") -> str:
@@ -32,6 +46,14 @@ def _config_float(values: Mapping[str, str], name: str, default: float) -> float
         return float(raw)
     except ValueError:
         return default
+
+
+def _config_list(values: Mapping[str, str], name: str) -> list[str]:
+    raw = _config_str(values, name)
+    if not raw:
+        return []
+    normalized = raw.replace("\n", ",").replace(";", ",")
+    return [item.strip() for item in normalized.split(",") if item.strip()]
 
 
 def _local_proxy_is_ready(proxy_url: str) -> bool:
@@ -70,8 +92,14 @@ def _load_config_values(project_root: Path) -> dict[str, str]:
         key = str(name or "").strip()
         if not key or value is None:
             continue
+        if _is_packaged_runtime() and key in _PACKAGED_IGNORED_ENV_KEYS:
+            continue
         values[key] = str(value)
     return values
+
+
+def _is_packaged_runtime() -> bool:
+    return bool(getattr(sys, "frozen", False))
 
 
 def resolve_websites_dir(project_root: Path) -> Path:
@@ -133,11 +161,14 @@ class AppConfig:
     runtime_dir: Path
     delivery_dir: Path
     llm_base_url: str
+    llm_base_urls: list[str]
     llm_key: str
     llm_model: str
     llm_reasoning_effort: str
     llm_api_style: str
     llm_concurrency: int
+    llm_ingress_rounds: int
+    llm_ingress_timeout_seconds: float
     capsolver_api_key: str
     capsolver_api_base_url: str
     capsolver_proxy: str
@@ -170,11 +201,14 @@ class AppConfig:
             runtime_dir=project_root / "output" / "runtime",
             delivery_dir=project_root / "output",
             llm_base_url=_config_str(values, "LLM_BASE_URL"),
+            llm_base_urls=_config_list(values, "LLM_BASE_URLS"),
             llm_key=resolved_llm_key,
             llm_model=_config_str(values, "LLM_MODEL", "gpt-5.4-mini"),
             llm_reasoning_effort=_config_str(values, "LLM_REASONING_EFFORT", "low"),
             llm_api_style=_config_str(values, "LLM_API_STYLE", "responses").lower(),
             llm_concurrency=max(_config_int(values, "LLM_CONCURRENCY", 32), 1),
+            llm_ingress_rounds=min(max(_config_int(values, "LLM_INGRESS_ROUNDS", 2), 1), 5),
+            llm_ingress_timeout_seconds=max(_config_float(values, "LLM_INGRESS_TIMEOUT_SECONDS", 15.0), 3.0),
             capsolver_api_key=_config_str(values, "CAPSOLVER_API_KEY"),
             capsolver_api_base_url=_config_str(values, "CAPSOLVER_API_BASE_URL", "https://api.capsolver.com"),
             capsolver_proxy=_config_str(values, "CAPSOLVER_PROXY"),

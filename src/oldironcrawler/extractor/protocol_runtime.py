@@ -29,9 +29,10 @@ def get_probe_executor() -> ThreadPoolExecutor:
 
 
 @contextmanager
-def request_slot(*, timeout_seconds: float | None = None):
+def request_slot(*, timeout_seconds: float | None = None, wait_timeout_seconds: float | None = None):
     semaphore = _get_request_slot_semaphore()
-    wait_timeout = None if timeout_seconds is None else max(timeout_seconds, 0.01)
+    wait_timeout_source = timeout_seconds if wait_timeout_seconds is None else wait_timeout_seconds
+    wait_timeout = None if wait_timeout_source is None else max(wait_timeout_source, 0.01)
     acquired = semaphore.acquire(timeout=wait_timeout)
     if not acquired:
         raise RuntimeError("request_slot_timeout")

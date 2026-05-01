@@ -467,21 +467,28 @@ def _close_connection_quietly(conn: sqlite3.Connection) -> None:
 
 
 _METRIC_COLUMNS = tuple(field.name for field in fields(SiteStageMetrics))
+_FAST_FAIL_TLS_ERROR_HINTS = (
+    "tls connect error",
+    "tlsv1_alert",
+    "sslv3_alert_handshake_failure",
+    "handshake failure",
+    "openssl_internal:invalid library",
+)
 
 
 def _max_retry_count_for_error(error_text: str) -> int:
     lowered = str(error_text or "").lower()
+    if any(token in lowered for token in _FAST_FAIL_TLS_ERROR_HINTS):
+        return 0
     if any(
         token in lowered
         for token in (
-            "tls connect error",
-            "tlsv1_alert",
-            "sslv3_alert_handshake_failure",
-            "openssl_internal",
             "getaddrinfo() thread failed to start",
             "thread failed to start",
             "request_slot_timeout",
             "llm_queue_timeout",
+            "service_temporarily_unavailable",
+            "llm 服务暂时不可用",
             "resource temporarily unavailable",
             "[errno 35]",
             "page_batch_timeout",

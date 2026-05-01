@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import gzip
-import html
 import re
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, wait
-from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlparse
 from xml.etree import ElementTree
 
@@ -15,7 +13,32 @@ from curl_cffi import requests as cffi_requests
 
 from oldironcrawler.challenge_solver import resolve_cloudflare_challenge
 from oldironcrawler.extractor.page_pool import PageFetchPool
-from oldironcrawler.extractor.protocol_runtime import configure_protocol_runtime, get_probe_executor, request_slot
+from oldironcrawler.extractor.protocol.content import (
+    decode_bytes as _decode_bytes,
+    decode_response_text as _decode_response_text,
+    detect_challenge_kind as _detect_challenge_kind,
+    raise_if_challenge_page as _raise_if_challenge_page,
+    truncate_html as _truncate_html,
+)
+from oldironcrawler.extractor.protocol.errors import (
+    PERMANENT_ERROR_HINTS as _PERMANENT_ERROR_HINTS,
+    TEMP_ERROR_HINTS as _TEMP_ERROR_HINTS,
+    ProtocolPermanentError,
+    ProtocolTemporaryError,
+    is_fast_fail_tls_handshake_error as _is_fast_fail_tls_handshake_error,
+    normalize_homepage_open_error as _normalize_homepage_open_error,
+    should_abort_common_probe_after_homepage_error as _should_abort_common_probe_after_homepage_error,
+)
+from oldironcrawler.extractor.protocol.fallbacks import (
+    build_empty_page_batch_error as _build_empty_page_batch_error,
+    build_www_fallback_url as _build_www_fallback_url,
+    is_supported_response as _is_supported_response,
+    replace_https_with_http as _replace_https_with_http,
+    should_try_http_fallback as _should_try_http_fallback,
+    should_try_httpx_fallback as _should_try_httpx_fallback,
+    should_try_httpx_status_fallback as _should_try_httpx_status_fallback,
+)
+from oldironcrawler.extractor.protocol.types import DiscoveryStageResult, HtmlPage, SiteProtocolConfig
 from oldironcrawler.extractor.protocol_discovery import (
     build_common_probe_urls as _build_common_probe_urls,
     extract_registrable_domain as _extract_registrable_domain,
@@ -26,118 +49,20 @@ from oldironcrawler.extractor.protocol_discovery import (
     pick_subdomain_probe_urls as _pick_subdomain_probe_urls,
     prioritize_discovery_urls as _prioritize_discovery_urls,
 )
+from oldironcrawler.extractor.protocol_runtime import configure_protocol_runtime, get_probe_executor, request_slot
 
-_HREF_RE = re.compile(r'<a\s[^>]*href=["\']([^"\']+)["\']', re.IGNORECASE)
 _ROBOTS_SITEMAP_RE = re.compile(r"^Sitemap:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
-_CHARSET_RE = re.compile(r"charset\s*=\s*[\"']?\s*([a-zA-Z0-9._-]+)", re.IGNORECASE)
-_HTML_META_CHARSET_RE = re.compile(br"<meta[^>]+charset=[\"']?\s*([a-zA-Z0-9._-]+)", re.IGNORECASE)
-_XML_ENCODING_RE = re.compile(br"<\?xml[^>]+encoding=[\"']\s*([a-zA-Z0-9._-]+)", re.IGNORECASE)
-_EMAIL_SIGNAL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
-_HTML_SIGNAL_PATTERNS = (
-    re.compile(r"<h[1-4][^>]*>.*?</h[1-4]>", re.IGNORECASE | re.DOTALL),
-    re.compile(
-        r"(founder|co-founder|owner|chairman|chief executive|managing director|group chief executive|president|principal solicitor|director|lead guide|leadership|executive team)",
-        re.IGNORECASE,
-    ),
-    _EMAIL_SIGNAL_RE,
-)
-_TEMP_ERROR_HINTS = (
-    "timeout",
-    "timed out",
-    "429",
-    "503",
-    "504",
-    "500",
-    "502",
-    "ssl",
-    "tls",
-    "eof",
-    "getaddrinfo() thread failed to start",
-    "thread failed to start",
-    "couldn't create thread",
-    "failed to create thread",
-    "resource temporarily unavailable",
-    "[errno 35]",
-    "request_slot_timeout",
-    "challenge_refetch_failed",
-)
-_PERMANENT_ERROR_HINTS = (
-    "could not resolve host",
-    "name or service not known",
-    "nodename nor servname",
-    "certificate has expired",
-    "ssl certificate problem",
-    "no alternative certificate subject name matches",
-    "certificate subject name",
-    "failed to connect",
-    "couldn't connect to server",
-    "connection refused",
-    "no route to host",
-    "network is unreachable",
-    "host is down",
-    "could not connect to server",
-)
-_TEXT_HINTS = ("text/html", "application/xhtml+xml", "application/xml", "text/xml", "text/plain")
-_CLOUDFLARE_CHALLENGE_HINTS = (
-    "just a moment...",
-    "cf-browser-verification",
-    "challenge-platform",
-    "cf-challenge",
-    "attention required! | cloudflare",
-)
-_SOFT_CHALLENGE_HINTS = (
-    ".well-known/sgcaptcha",
-    "sgcaptcha",
-)
-_INCAPSULA_CHALLENGE_HINTS = (
-    "_incapsula_resource",
-    "incapsula incident id",
-    "imperva",
-)
 _NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 _SITE_DEADLINE_SAFETY_SECONDS = 8.0
-class ProtocolTemporaryError(RuntimeError):
-    pass
-class ProtocolPermanentError(RuntimeError):
-    pass
-@dataclass
-class HtmlPage:
-    url: str
-    html: str
+_REQUEST_SLOT_WAIT_FLOOR_SECONDS = 20.0
+_REQUEST_SLOT_WAIT_CAP_SECONDS = 45.0
+_REQUEST_SLOT_WAIT_MULTIPLIER = 4.0
+_DISCOVERY_HOMEPAGE_TIMEOUT_CAP_SECONDS = 20.0
+_COMMON_PROBE_REQUEST_TIMEOUT_SECONDS = 3.0
+_COMMON_PROBE_BATCH_WAIT_CAP_SECONDS = 6.0
+_COMMON_PROBE_SLOT_WAIT_SECONDS = 2.0
 
 
-@dataclass
-class DiscoveryStageResult:
-    urls: list[str]
-    homepage_html: str
-
-
-@dataclass
-class SiteProtocolConfig:
-    timeout_seconds: float = 10.0
-    max_retries: int = 2
-    proxy_url: str = ""
-    capsolver_api_key: str = ""
-    capsolver_api_base_url: str = "https://api.capsolver.com"
-    capsolver_proxy: str = ""
-    capsolver_poll_seconds: float = 3.0
-    capsolver_max_wait_seconds: float = 40.0
-    cloudflare_proxy_url: str = ""
-    impersonate: str = "chrome110"
-    max_html_chars: int = 250_000
-    page_batch_timeout_seconds: float = 45.0
-    deadline_monotonic: float | None = None
-    common_probe_target: int = 8
-    common_probe_concurrency: int = 8
-    probe_worker_count: int = 16
-    common_probe_patience_batches: int = 2
-    common_probe_min_hits_after_patience: int = 2
-    related_seed_limit: int = 2
-    request_slot_limit: int = 8
-    default_headers: dict[str, str] = field(default_factory=lambda: {
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    })
 class SiteProtocolClient:
     def __init__(self, config: SiteProtocolConfig) -> None:
         self._config = config
@@ -214,7 +139,11 @@ class SiteProtocolClient:
         if page_pool is not None and filtered:
             pages = page_pool.fetch_pages(
                 urls=filtered,
-                fetch_one=lambda url: self._fetch_page_optional(url, timeout_seconds=min(self._config.timeout_seconds, max(deadline - time.monotonic(), 0.01))),
+                fetch_one=lambda url: self._call_fetch_page_optional(
+                    url,
+                    timeout_seconds=min(self._config.timeout_seconds, max(deadline - time.monotonic(), 0.01)),
+                    request_deadline_monotonic=deadline,
+                ),
                 deadline_monotonic=deadline,
             )
             if pages:
@@ -226,7 +155,11 @@ class SiteProtocolClient:
                 timed_out = True
                 break
             try:
-                page = self._fetch_page_optional(url, timeout_seconds=min(self._config.timeout_seconds, remaining))
+                page = self._call_fetch_page_optional(
+                    url,
+                    timeout_seconds=min(self._config.timeout_seconds, remaining),
+                    request_deadline_monotonic=deadline,
+                )
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 continue
@@ -239,9 +172,21 @@ class SiteProtocolClient:
         if not pages and filtered:
             raise ProtocolTemporaryError(_build_empty_page_batch_error(filtered))
         return pages
-    def _fetch_page_optional(self, url: str, *, timeout_seconds: float | None = None) -> HtmlPage | None:
+    def _fetch_page_optional(
+        self,
+        url: str,
+        *,
+        timeout_seconds: float | None = None,
+        request_deadline_monotonic: float | None = None,
+    ) -> HtmlPage | None:
         session = self._get_or_create_session()
-        html_text = self._fetch_html(session, url, required=False, timeout_seconds=timeout_seconds)
+        html_text = self._fetch_html(
+            session,
+            url,
+            required=False,
+            timeout_seconds=timeout_seconds,
+            request_deadline_monotonic=request_deadline_monotonic,
+        )
         if not html_text.strip():
             return None
         return HtmlPage(url=url, html=html_text)
@@ -283,6 +228,9 @@ class SiteProtocolClient:
         required: bool,
         timeout_seconds: float | None = None,
         max_retries_override: int | None = None,
+        request_slot_wait_seconds: float | None = None,
+        request_deadline_monotonic: float | None = None,
+        allow_httpx_fallback: bool = True,
     ) -> str:
         retries = self._config.max_retries if max_retries_override is None else max(max_retries_override, 0)
         attempts = retries + 1
@@ -290,8 +238,18 @@ class SiteProtocolClient:
         for _ in range(attempts):
             response = None
             try:
-                request_timeout = self._resolve_timeout(timeout_seconds)
-                with request_slot(timeout_seconds=request_timeout):
+                request_timeout = self._resolve_timeout(
+                    timeout_seconds,
+                    deadline_monotonic=request_deadline_monotonic,
+                )
+                with request_slot(
+                    timeout_seconds=request_timeout,
+                    wait_timeout_seconds=self._bounded_request_slot_wait_timeout(
+                        request_timeout,
+                        request_slot_wait_seconds,
+                        deadline_monotonic=request_deadline_monotonic,
+                    ),
+                ):
                     response = session.get(url, timeout=request_timeout)
                 status = int(response.status_code)
                 if status == 200:
@@ -319,6 +277,7 @@ class SiteProtocolClient:
                         status_code=status,
                         response_text=response_text,
                         timeout_seconds=request_timeout,
+                        request_deadline_monotonic=request_deadline_monotonic,
                     )
                     if httpx_html is not None:
                         return httpx_html
@@ -328,29 +287,52 @@ class SiteProtocolClient:
                 if required:
                     raise ProtocolPermanentError(f"http_{status}: {url}")
                 return ""
-            except ProtocolTemporaryError:
-                last_error = ProtocolTemporaryError(f"temporary_request: {url}")
+            except ProtocolTemporaryError as exc:
+                last_error = exc
             except ProtocolPermanentError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 lowered = str(exc).lower()
-                if _should_prefer_httpx_fallback(lowered):
-                    httpx_html = self._try_httpx_fallback(url, lowered)
-                    if httpx_html is not None:
-                        return httpx_html
-                insecure_html = self._try_insecure_https_fallback(url, lowered)
+                if _is_fast_fail_tls_handshake_error(lowered):
+                    raise ProtocolPermanentError(str(exc)) from exc
+                insecure_html = self._call_optional_fallback(
+                    self._try_insecure_https_fallback,
+                    url,
+                    lowered,
+                    request_deadline_monotonic=request_deadline_monotonic,
+                )
                 if insecure_html is not None:
                     return insecure_html
-                fallback_html = self._try_http_fallback(session, url, lowered)
+                fallback_html = self._call_optional_fallback(
+                    self._try_http_fallback,
+                    session,
+                    url,
+                    lowered,
+                    request_deadline_monotonic=request_deadline_monotonic,
+                )
                 if fallback_html is not None:
                     return fallback_html
-                www_html = self._try_www_fallback(session, url, lowered)
+                www_html = self._call_optional_fallback(
+                    self._try_www_fallback,
+                    session,
+                    url,
+                    lowered,
+                    request_deadline_monotonic=request_deadline_monotonic,
+                )
                 if www_html is not None:
                     return www_html
-                httpx_html = self._try_httpx_fallback(url, lowered)
-                if httpx_html is not None:
-                    return httpx_html
+                if allow_httpx_fallback:
+                    httpx_html = self._call_optional_fallback(
+                        self._try_httpx_fallback,
+                        url,
+                        lowered,
+                        timeout_seconds=request_timeout,
+                        request_slot_wait_seconds=request_slot_wait_seconds,
+                        request_deadline_monotonic=request_deadline_monotonic,
+                    )
+                    if httpx_html is not None:
+                        return httpx_html
                 if any(hint in lowered for hint in _PERMANENT_ERROR_HINTS):
                     raise ProtocolPermanentError(str(exc)) from exc
                 if any(hint in lowered for hint in _TEMP_ERROR_HINTS):
@@ -368,20 +350,88 @@ class SiteProtocolClient:
             raise ProtocolTemporaryError(str(last_error or f"temporary_request: {url}"))
         return ""
 
-    def _resolve_timeout(self, timeout_seconds: float | None = None) -> float:
+    def _resolve_timeout(
+        self,
+        timeout_seconds: float | None = None,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> float:
         base_timeout = timeout_seconds if timeout_seconds is not None else self._config.timeout_seconds
-        remaining = self._remaining_deadline_seconds()
+        remaining = self._remaining_deadline_seconds(deadline_monotonic=deadline_monotonic)
         if remaining is None:
             return max(base_timeout, 0.05)
         if remaining <= 0:
             raise ProtocolTemporaryError("site_deadline_exceeded")
         return max(min(base_timeout, remaining), 0.05)
 
-    def _remaining_deadline_seconds(self) -> float | None:
-        deadline = self._config.deadline_monotonic
-        if deadline is None:
+    def _remaining_deadline_seconds(self, *, deadline_monotonic: float | None = None) -> float | None:
+        if deadline_monotonic is not None:
+            return deadline_monotonic - time.monotonic()
+        if self._config.deadline_monotonic is None:
             return None
-        return deadline - time.monotonic() - _SITE_DEADLINE_SAFETY_SECONDS
+        return self._config.deadline_monotonic - time.monotonic() - _SITE_DEADLINE_SAFETY_SECONDS
+
+    def _resolve_request_slot_wait_timeout(
+        self,
+        request_timeout_seconds: float,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> float:
+        base_timeout = max(float(request_timeout_seconds or self._config.timeout_seconds or 0.0), 0.05)
+        wait_timeout = min(
+            max(base_timeout * _REQUEST_SLOT_WAIT_MULTIPLIER, _REQUEST_SLOT_WAIT_FLOOR_SECONDS),
+            _REQUEST_SLOT_WAIT_CAP_SECONDS,
+        )
+        remaining = self._remaining_deadline_seconds(deadline_monotonic=deadline_monotonic)
+        if remaining is None:
+            return wait_timeout
+        if remaining <= 0:
+            raise ProtocolTemporaryError("site_deadline_exceeded")
+        return max(min(wait_timeout, remaining), 0.05)
+
+    def _bounded_request_slot_wait_timeout(
+        self,
+        request_timeout_seconds: float,
+        wait_timeout_seconds: float | None,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> float:
+        resolved = self._resolve_request_slot_wait_timeout(
+            request_timeout_seconds,
+            deadline_monotonic=deadline_monotonic,
+        )
+        if wait_timeout_seconds is None:
+            return resolved
+        return max(min(resolved, float(wait_timeout_seconds)), 0.01)
+
+    def _call_optional_fallback(self, func, *args, **kwargs):
+        pending_kwargs = dict(kwargs)
+        optional_keys = ("request_deadline_monotonic", "request_slot_wait_seconds", "timeout_seconds")
+        while True:
+            try:
+                return func(*args, **pending_kwargs)
+            except TypeError as exc:
+                lowered = str(exc).lower()
+                if "unexpected keyword" not in lowered:
+                    raise
+                removed = False
+                for key in optional_keys:
+                    if key in pending_kwargs:
+                        pending_kwargs.pop(key, None)
+                        removed = True
+                        break
+                if not removed:
+                    raise
+
+    def _call_fetch_page_optional(self, url: str, **kwargs):
+        try:
+            return self._fetch_page_optional(url, **kwargs)
+        except TypeError as exc:
+            if "unexpected keyword" not in str(exc).lower():
+                raise
+            fallback_kwargs = dict(kwargs)
+            fallback_kwargs.pop("request_deadline_monotonic", None)
+            return self._fetch_page_optional(url, **fallback_kwargs)
 
     def _maybe_challenge_fallback(
         self,
@@ -420,7 +470,10 @@ class SiteProtocolClient:
         response = None
         try:
             request_timeout = self._resolve_timeout(timeout_seconds)
-            with request_slot(timeout_seconds=request_timeout):
+            with request_slot(
+                timeout_seconds=request_timeout,
+                wait_timeout_seconds=self._resolve_request_slot_wait_timeout(request_timeout),
+            ):
                 response = session.get(url, timeout=request_timeout)
             if int(response.status_code) != 200:
                 return ""
@@ -443,11 +496,18 @@ class SiteProtocolClient:
         lowered_error: str,
         *,
         timeout_seconds: float | None = None,
+        request_slot_wait_seconds: float | None = None,
+        request_deadline_monotonic: float | None = None,
     ) -> str | None:
         if not _should_try_httpx_fallback(lowered_error):
             return None
         try:
-            return self._request_httpx_html(url, timeout_seconds=timeout_seconds)
+            return self._request_httpx_html(
+                url,
+                timeout_seconds=timeout_seconds,
+                request_slot_wait_seconds=request_slot_wait_seconds,
+                request_deadline_monotonic=request_deadline_monotonic,
+            )
         except Exception:  # noqa: BLE001
             return None
 
@@ -458,22 +518,39 @@ class SiteProtocolClient:
         status_code: int,
         response_text: str,
         timeout_seconds: float | None = None,
+        request_deadline_monotonic: float | None = None,
     ) -> str | None:
         if not _should_try_httpx_status_fallback(url, status_code, response_text):
             return None
         try:
-            return self._request_httpx_html(url, timeout_seconds=timeout_seconds)
+            return self._request_httpx_html(
+                url,
+                timeout_seconds=timeout_seconds,
+                request_deadline_monotonic=request_deadline_monotonic,
+            )
         except Exception:  # noqa: BLE001
             return None
 
-    def _request_httpx_html(self, url: str, *, timeout_seconds: float | None = None) -> str | None:
-        request_timeout = self._resolve_timeout(timeout_seconds)
+    def _request_httpx_html(
+        self,
+        url: str,
+        *,
+        timeout_seconds: float | None = None,
+        request_slot_wait_seconds: float | None = None,
+        request_deadline_monotonic: float | None = None,
+    ) -> str | None:
+        request_timeout = self._resolve_timeout(
+            timeout_seconds,
+            deadline_monotonic=request_deadline_monotonic,
+        )
         last_challenge_html = ""
         for _attempt in range(2):
             status, content_type, response_text = self._fetch_httpx_snapshot(
                 url,
                 timeout_seconds=request_timeout,
                 fresh_client=bool(_attempt),
+                request_slot_wait_seconds=request_slot_wait_seconds,
+                request_deadline_monotonic=request_deadline_monotonic,
             )
             if status == 200:
                 if not _is_supported_response(url, content_type):
@@ -497,17 +574,33 @@ class SiteProtocolClient:
         *,
         timeout_seconds: float,
         fresh_client: bool,
+        request_slot_wait_seconds: float | None = None,
+        request_deadline_monotonic: float | None = None,
     ) -> tuple[int, str, str]:
         if fresh_client:
             with httpx.Client(**self._build_httpx_client_kwargs(timeout_seconds)) as client:
-                with request_slot(timeout_seconds=timeout_seconds):
+                with request_slot(
+                    timeout_seconds=timeout_seconds,
+                    wait_timeout_seconds=self._bounded_request_slot_wait_timeout(
+                        timeout_seconds,
+                        request_slot_wait_seconds,
+                        deadline_monotonic=request_deadline_monotonic,
+                    ),
+                ):
                     response = client.get(url, timeout=timeout_seconds)
                 return (
                     int(response.status_code),
                     str(response.headers.get("Content-Type", "") or "").lower(),
                     _truncate_html(str(response.text or ""), self._config.max_html_chars),
                 )
-        with request_slot(timeout_seconds=timeout_seconds):
+        with request_slot(
+            timeout_seconds=timeout_seconds,
+            wait_timeout_seconds=self._bounded_request_slot_wait_timeout(
+                timeout_seconds,
+                request_slot_wait_seconds,
+                deadline_monotonic=request_deadline_monotonic,
+            ),
+        ):
             response = self._http_client.get(url, timeout=timeout_seconds)
         return (
             int(response.status_code),
@@ -515,10 +608,16 @@ class SiteProtocolClient:
             _truncate_html(str(response.text or ""), self._config.max_html_chars),
         )
 
-    def _try_insecure_https_fallback(self, url: str, lowered_error: str) -> str | None:
+    def _try_insecure_https_fallback(
+        self,
+        url: str,
+        lowered_error: str,
+        *,
+        request_deadline_monotonic: float | None = None,
+    ) -> str | None:
         if not _should_try_http_fallback(url, lowered_error):
             return None
-        request_timeout = self._resolve_timeout()
+        request_timeout = self._resolve_timeout(deadline_monotonic=request_deadline_monotonic)
         client_kwargs: dict[str, object] = {
             "follow_redirects": True,
             "headers": dict(self._config.default_headers),
@@ -530,7 +629,13 @@ class SiteProtocolClient:
             client_kwargs["proxy"] = self._config.proxy_url
         try:
             with httpx.Client(**client_kwargs) as client:
-                with request_slot(timeout_seconds=request_timeout):
+                with request_slot(
+                    timeout_seconds=request_timeout,
+                    wait_timeout_seconds=self._resolve_request_slot_wait_timeout(
+                        request_timeout,
+                        deadline_monotonic=request_deadline_monotonic,
+                    ),
+                ):
                     response = client.get(url, timeout=request_timeout)
                 if int(response.status_code) != 200:
                     return None
@@ -543,14 +648,27 @@ class SiteProtocolClient:
         except Exception:  # noqa: BLE001
             return None
 
-    def _try_http_fallback(self, session: cffi_requests.Session, url: str, lowered_error: str) -> str | None:
+    def _try_http_fallback(
+        self,
+        session: cffi_requests.Session,
+        url: str,
+        lowered_error: str,
+        *,
+        request_deadline_monotonic: float | None = None,
+    ) -> str | None:
         if not _should_try_http_fallback(url, lowered_error):
             return None
         fallback_url = _replace_https_with_http(url)
         response = None
         try:
-            request_timeout = self._resolve_timeout()
-            with request_slot(timeout_seconds=request_timeout):
+            request_timeout = self._resolve_timeout(deadline_monotonic=request_deadline_monotonic)
+            with request_slot(
+                timeout_seconds=request_timeout,
+                wait_timeout_seconds=self._resolve_request_slot_wait_timeout(
+                    request_timeout,
+                    deadline_monotonic=request_deadline_monotonic,
+                ),
+            ):
                 response = session.get(fallback_url, timeout=request_timeout)
             if int(response.status_code) != 200:
                 return None
@@ -569,14 +687,27 @@ class SiteProtocolClient:
                 except Exception:  # noqa: BLE001
                     pass
 
-    def _try_www_fallback(self, session: cffi_requests.Session, url: str, lowered_error: str) -> str | None:
+    def _try_www_fallback(
+        self,
+        session: cffi_requests.Session,
+        url: str,
+        lowered_error: str,
+        *,
+        request_deadline_monotonic: float | None = None,
+    ) -> str | None:
         fallback_url = _build_www_fallback_url(url, lowered_error)
         if not fallback_url:
             return None
         response = None
         try:
-            request_timeout = self._resolve_timeout()
-            with request_slot(timeout_seconds=request_timeout):
+            request_timeout = self._resolve_timeout(deadline_monotonic=request_deadline_monotonic)
+            with request_slot(
+                timeout_seconds=request_timeout,
+                wait_timeout_seconds=self._resolve_request_slot_wait_timeout(
+                    request_timeout,
+                    deadline_monotonic=request_deadline_monotonic,
+                ),
+            ):
                 response = session.get(fallback_url, timeout=request_timeout)
             if int(response.status_code) != 200:
                 return None
@@ -613,7 +744,10 @@ class SiteProtocolClient:
         robots_url = urljoin(base_url, "/robots.txt")
         try:
             request_timeout = self._resolve_timeout()
-            with request_slot(timeout_seconds=request_timeout):
+            with request_slot(
+                timeout_seconds=request_timeout,
+                wait_timeout_seconds=self._resolve_request_slot_wait_timeout(request_timeout),
+            ):
                 response = session.get(robots_url, timeout=request_timeout)
             if int(response.status_code) != 200:
                 return []
@@ -694,9 +828,11 @@ class SiteProtocolClient:
         homepage_html = ""
         homepage_error: Exception | None = None
         try:
-            homepage_html = self._fetch_html(session, start_url, required=False)
+            homepage_html = self._fetch_discovery_homepage(session, start_url)
         except (ProtocolPermanentError, ProtocolTemporaryError) as exc:
             homepage_error = exc
+        if homepage_error is not None and _should_abort_common_probe_after_homepage_error(homepage_error):
+            raise _normalize_homepage_open_error(start_url, homepage_error) from homepage_error
         guessed_urls = self._probe_common_value_urls(session, start_url, limit=limit)
         homepage_links = _extract_same_site_links(homepage_html, start_url, limit=limit) if homepage_html else []
         merged = _merge_unique_urls(guessed_urls, homepage_links, limit=limit)
@@ -707,6 +843,24 @@ class SiteProtocolClient:
         if homepage_error is not None:
             raise homepage_error
         return [], ""
+
+    def _fetch_discovery_homepage(self, session: cffi_requests.Session, start_url: str) -> str:
+        timeout_seconds = min(self._config.timeout_seconds, _DISCOVERY_HOMEPAGE_TIMEOUT_CAP_SECONDS)
+        request_deadline = time.monotonic() + timeout_seconds
+        try:
+            return self._fetch_html(
+                session,
+                start_url,
+                required=False,
+                timeout_seconds=timeout_seconds,
+                max_retries_override=0,
+                request_deadline_monotonic=request_deadline,
+                allow_httpx_fallback=False,
+            )
+        except TypeError as exc:
+            if "unexpected keyword" not in str(exc).lower():
+                raise
+            return self._fetch_html(session, start_url, required=False, timeout_seconds=timeout_seconds)
 
     def _probe_common_value_urls(
         self,
@@ -749,7 +903,8 @@ class SiteProtocolClient:
             return []
         futures: dict[Future, str] = {}
         results: list[str] = []
-        wait_deadline = time.monotonic() + self._resolve_timeout()
+        batch_timeout = min(self._config.timeout_seconds, _COMMON_PROBE_BATCH_WAIT_CAP_SECONDS)
+        wait_deadline = time.monotonic() + self._resolve_timeout(batch_timeout)
         for probe_url in probe_urls:
             futures[get_probe_executor().submit(self._probe_common_value_url, probe_url)] = probe_url
         while futures:
@@ -778,8 +933,10 @@ class SiteProtocolClient:
                 session,
                 probe_url,
                 required=False,
-                timeout_seconds=min(self._config.timeout_seconds, 4.0),
+                timeout_seconds=min(self._config.timeout_seconds, _COMMON_PROBE_REQUEST_TIMEOUT_SECONDS),
                 max_retries_override=0,
+                request_slot_wait_seconds=_COMMON_PROBE_SLOT_WAIT_SECONDS,
+                allow_httpx_fallback=False,
             )
         except ProtocolPermanentError:
             # 公共探测阶段只保留真实正文页，挑战页不再当成“命中页”。
@@ -844,7 +1001,10 @@ class SiteProtocolClient:
     def _fetch_sitemap_text(self, session: cffi_requests.Session, url: str) -> str:
         try:
             request_timeout = self._resolve_timeout()
-            with request_slot(timeout_seconds=request_timeout):
+            with request_slot(
+                timeout_seconds=request_timeout,
+                wait_timeout_seconds=self._resolve_request_slot_wait_timeout(request_timeout),
+            ):
                 response = session.get(url, timeout=request_timeout)
             if int(response.status_code) != 200:
                 return ""
@@ -857,259 +1017,3 @@ class SiteProtocolClient:
             return _decode_bytes(content, str(response.headers.get("Content-Type", "") or ""))
         except Exception:  # noqa: BLE001
             return ""
-
-def _should_try_http_fallback(url: str, lowered_error: str) -> bool:
-    if not url.lower().startswith("https://"):
-        return False
-    return any(
-        token in lowered_error
-        for token in (
-            "ssl certificate",
-            "certificate has expired",
-            "certificate subject name",
-            "tls connect error",
-            "ssl:",
-            "tlsv1_alert",
-            "openssl_internal",
-        )
-    )
-
-
-def _should_try_httpx_fallback(lowered_error: str) -> bool:
-    return any(
-        token in lowered_error
-        for token in (
-            "tls connect error",
-            "tlsv1_alert",
-            "sslv3_alert_handshake_failure",
-            "openssl_internal",
-            "getaddrinfo() thread failed to start",
-            "thread failed to start",
-            "couldn't create thread",
-            "failed to create thread",
-            "empty reply from server",
-            "timed out",
-            "timeout",
-            "connection reset",
-            "recv failure",
-            "connection closed abruptly",
-        )
-    )
-
-
-def _should_prefer_httpx_fallback(lowered_error: str) -> bool:
-    return any(
-        token in lowered_error
-        for token in (
-            "tls connect error",
-            "tlsv1_alert",
-            "sslv3_alert_handshake_failure",
-            "openssl_internal",
-        )
-    )
-
-
-def _should_try_httpx_status_fallback(url: str, status_code: int, response_text: str) -> bool:
-    if status_code == 202:
-        return True
-    if status_code != 404:
-        return False
-    if _is_root_like_url(url):
-        return True
-    lowered = str(response_text or "").lower()
-    return any(token in lowered for token in ("wixerrorpagesapp", "page not found", "not found"))
-
-
-def _replace_https_with_http(url: str) -> str:
-    if url.lower().startswith("https://"):
-        return f"http://{url[8:]}"
-    return url
-
-
-def _build_www_fallback_url(url: str, lowered_error: str) -> str:
-    if not any(token in lowered_error for token in ("connection closed abruptly", "empty reply from server", "connection reset", "recv failure")):
-        return ""
-    parsed = urlparse(str(url or ""))
-    host = str(parsed.netloc or "").strip()
-    if not host or host.lower().startswith("www."):
-        return ""
-    return parsed._replace(netloc=f"www.{host}").geturl()
-
-
-def _is_root_like_url(url: str) -> bool:
-    parsed = urlparse(str(url or ""))
-    path = str(parsed.path or "").strip()
-    return not path or path == "/"
-
-
-def _build_empty_page_batch_error(urls: list[str]) -> str:
-    if not urls:
-        return "empty_page_batch"
-    preview = ", ".join(urls[:2])
-    if len(urls) > 2:
-        preview = f"{preview}, ..."
-    return f"empty_page_batch: {preview}"
-
-
-def _is_supported_response(url: str, content_type: str) -> bool:
-    if not _is_supported_url(url):
-        return False
-    return any(hint in content_type for hint in _TEXT_HINTS) or not content_type
-
-def _truncate_html(text: str, max_chars: int) -> str:
-    if len(text) <= max_chars:
-        return text
-    head_keep = max(max_chars // 3, 1)
-    tail_keep = max(max_chars // 3, 1)
-    middle_budget = max(max_chars - head_keep - tail_keep - 96, 0)
-    middle = _collect_signal_html_windows(text, middle_budget)
-    if middle:
-        parts = [middle, "\n<!-- 页面内容过长已截断，已保留中部重点片段 -->\n", text[:head_keep]]
-    else:
-        parts = [text[:head_keep]]
-    parts.extend(["\n<!-- 页面内容过长已截断 -->\n", text[-tail_keep:]])
-    return "".join(parts)[:max_chars]
-
-
-def _collect_signal_html_windows(text: str, max_chars: int) -> str:
-    if max_chars <= 0:
-        return ""
-    windows = _merge_html_signal_windows(_find_html_signal_windows(text))
-    if not windows:
-        return ""
-    lines: list[str] = []
-    for start, end in windows:
-        fragment_lines = _extract_signal_lines(text[start:end])
-        if not fragment_lines:
-            continue
-        for line in fragment_lines:
-            if line not in lines:
-                lines.append(line)
-        summary = _render_signal_summary(lines)
-        if len(summary) >= max_chars:
-            return summary[:max_chars]
-    return _render_signal_summary(lines)[:max_chars]
-
-
-def _find_html_signal_windows(text: str) -> list[tuple[int, int]]:
-    windows: list[tuple[int, int]] = []
-    for pattern in _HTML_SIGNAL_PATTERNS:
-        for match in pattern.finditer(text):
-            start = max(match.start() - 900, 0)
-            end = min(match.end() + 1600, len(text))
-            windows.append((start, end))
-            if len(windows) >= 24:
-                return windows
-    return windows
-
-
-def _merge_html_signal_windows(windows: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    if not windows:
-        return []
-    ordered = sorted(windows)
-    merged: list[tuple[int, int]] = []
-    start, end = ordered[0]
-    for next_start, next_end in ordered[1:]:
-        if next_start <= end + 256:
-            end = max(end, next_end)
-            continue
-        merged.append((start, end))
-        start, end = next_start, next_end
-    merged.append((start, end))
-    return merged[:8]
-
-
-def _extract_signal_lines(fragment: str) -> list[str]:
-    text = html.unescape(re.sub(r"<[^>]+>", "\n", str(fragment or "")))
-    raw_lines = []
-    for raw_line in text.splitlines():
-        clean = re.sub(r"\s+", " ", raw_line).strip()
-        if len(clean) >= 2:
-            raw_lines.append(clean)
-    if not raw_lines:
-        return []
-    picked: list[str] = []
-    for index, line in enumerate(raw_lines):
-        lowered = line.lower()
-        if not (_EMAIL_SIGNAL_RE.search(line) or any(token in lowered for token in (
-            "founder", "co-founder", "owner", "chairman", "chief executive", "managing director",
-            "group chief executive", "president", "principal solicitor", "director", "lead guide",
-            "leadership", "executive team",
-        ))):
-            continue
-        start = max(index - 1, 0)
-        end = min(index + 3, len(raw_lines))
-        for candidate in raw_lines[start:end]:
-            if candidate not in picked:
-                picked.append(candidate)
-    if picked:
-        return picked[:24]
-    fallback: list[str] = []
-    for line in raw_lines:
-        if line not in fallback:
-            fallback.append(line)
-        if len(fallback) >= 12:
-            break
-    return fallback
-
-
-def _render_signal_summary(lines: list[str]) -> str:
-    if not lines:
-        return ""
-    body = "".join(f"<p>{html.escape(line)}</p>" for line in lines)
-    return f"<section data-oldiron-signal='1'><h2>重点正文片段</h2>{body}</section>"
-
-
-def _raise_if_challenge_page(url: str, html_text: str) -> None:
-    challenge_kind = _detect_challenge_kind(html_text)
-    if not challenge_kind:
-        return
-    raise ProtocolPermanentError(f"{challenge_kind}: {url}")
-
-
-def _detect_challenge_kind(html_text: str) -> str:
-    lowered = str(html_text or "").lower()
-    if not lowered:
-        return ""
-    if any(hint in lowered for hint in _CLOUDFLARE_CHALLENGE_HINTS):
-        return "cloudflare_challenge"
-    if any(hint in lowered for hint in _SOFT_CHALLENGE_HINTS):
-        return "sgcaptcha_challenge"
-    if any(hint in lowered for hint in _INCAPSULA_CHALLENGE_HINTS):
-        return "imperva_challenge"
-    return ""
-
-
-def _decode_response_text(response: object) -> str:
-    content = getattr(response, "content", b"")
-    headers = getattr(response, "headers", {})
-    return _decode_bytes(bytes(content or b""), str(headers.get("Content-Type", "") or ""))
-
-
-def _decode_bytes(content: bytes, content_type: str) -> str:
-    if not content:
-        return ""
-    encodings = _candidate_encodings(content_type, content)
-    for encoding in encodings:
-        try:
-            return content.decode(encoding)
-        except (LookupError, UnicodeDecodeError):
-            continue
-    return content.decode("utf-8", errors="replace")
-
-
-def _candidate_encodings(content_type: str, content: bytes) -> list[str]:
-    values: list[str] = []
-    match = _CHARSET_RE.search(str(content_type or ""))
-    if match is not None:
-        values.append(str(match.group(1) or "").strip().lower())
-    head = bytes(content[:4096])
-    for pattern in (_HTML_META_CHARSET_RE, _XML_ENCODING_RE):
-        match = pattern.search(head)
-        if match is None:
-            continue
-        values.append(match.group(1).decode("ascii", errors="ignore").strip().lower())
-    for fallback in ("utf-8", "utf-8-sig", "cp932", "shift_jis", "euc_jp", "latin-1"):
-        if fallback not in values:
-            values.append(fallback)
-    return values

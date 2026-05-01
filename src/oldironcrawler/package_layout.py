@@ -5,14 +5,15 @@ from pathlib import Path
 
 _PACKAGED_ALLOWED_KEYS = {
     "LLM_BASE_URL",
+    "LLM_BASE_URLS",
     "LLM_MODEL",
     "LLM_REASONING_EFFORT",
     "LLM_API_STYLE",
-    "CAPSOLVER_API_KEY",
+    "LLM_INGRESS_ROUNDS",
+    "LLM_INGRESS_TIMEOUT_SECONDS",
     "CAPSOLVER_API_BASE_URL",
-    "CAPSOLVER_PROXY",
-    "CLOUDFLARE_PROXY_URL",
-    "PROXY_URL",
+    "CAPSOLVER_POLL_SECONDS",
+    "CAPSOLVER_MAX_WAIT_SECONDS",
     "LLM_CONCURRENCY",
     "SITE_CONCURRENCY",
     "PAGE_CONCURRENCY",
@@ -26,6 +27,14 @@ _PACKAGED_ALLOWED_KEYS = {
     "REQUEST_TIMEOUT_SECONDS",
     "TOTAL_WAIT_SECONDS",
 }
+_PACKAGED_SECRET_KEYS = (
+    "LLM_KEY",
+    "LLM_API_KEY",
+    "CAPSOLVER_API_KEY",
+    "CAPSOLVER_PROXY",
+    "CLOUDFLARE_PROXY_URL",
+    "PROXY_URL",
+)
 _PACKAGED_OVERRIDES: dict[str, str] = {}
 
 
@@ -46,23 +55,17 @@ def _write_packaged_env(*, repo_root: Path, package_root: Path) -> None:
     source_env = repo_root / ".env"
     lines = source_env.read_text(encoding="utf-8").splitlines() if source_env.exists() else []
     cleaned: list[str] = []
-    seen_key = False
-    seen_api_key = False
+    seen_secret_keys: set[str] = set()
     seen_allowed: set[str] = set()
     for line in lines:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
-            cleaned.append(line)
             continue
         key, _separator, _value = stripped.partition("=")
         key = key.strip()
-        if stripped.startswith("LLM_KEY="):
-            cleaned.append("LLM_KEY=")
-            seen_key = True
-            continue
-        if stripped.startswith("LLM_API_KEY="):
-            cleaned.append("LLM_API_KEY=")
-            seen_api_key = True
+        if key in _PACKAGED_SECRET_KEYS:
+            cleaned.append(f"{key}=")
+            seen_secret_keys.add(key)
             continue
         if key not in _PACKAGED_ALLOWED_KEYS:
             continue
@@ -71,10 +74,9 @@ def _write_packaged_env(*, repo_root: Path, package_root: Path) -> None:
             cleaned.append(f"{key}={_PACKAGED_OVERRIDES[key]}")
             continue
         cleaned.append(line)
-    if not seen_key:
-        cleaned.append("LLM_KEY=")
-    if not seen_api_key:
-        cleaned.append("LLM_API_KEY=")
+    for key in _PACKAGED_SECRET_KEYS:
+        if key not in seen_secret_keys:
+            cleaned.append(f"{key}=")
     for name, value in _PACKAGED_OVERRIDES.items():
         if name in seen_allowed:
             continue

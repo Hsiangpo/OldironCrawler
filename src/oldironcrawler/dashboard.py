@@ -19,9 +19,10 @@ class DashboardSession:
     project_root: Path
     current_key: str
     selected_input: Path | None = None
-    concurrency: int = 32
-    site_timeout_seconds: int = 180
+    concurrency: int = app_module.DEFAULT_SITE_CONCURRENCY
+    site_timeout_seconds: int = app_module.DEFAULT_SITE_TIMEOUT_SECONDS
     last_delivery_path: Path | None = None
+    llm_base_url: str = ""
 
 
 def run_dashboard(project_root: Path, initial_key: str) -> int:
@@ -38,6 +39,7 @@ def run_dashboard(project_root: Path, initial_key: str) -> int:
                 f"当前文件：{session.selected_input.name if session.selected_input else '未选择'}",
                 f"可爬表数量：{len(list_input_files(_get_websites_dir(session.project_root)))}",
                 f"结果文件数量：{len(_list_output_results(session.project_root / 'output'))}",
+                f"API 入口：{session.llm_base_url or '未测速'}",
                 f"并发设置：{session.concurrency}",
                 f"单站等待上限：{session.site_timeout_seconds} 秒",
                 "",
@@ -79,6 +81,7 @@ def _ensure_key_before_panel(session: DashboardSession) -> None:
                 site_timeout_seconds=session.site_timeout_seconds,
             )
             app_module._validate_llm_runtime(config)
+            session.llm_base_url = config.llm_base_url
             app_module._persist_runtime_llm_key(session.project_root, session.current_key)
             return
         except (LlmConfigurationError, LlmTemporaryError) as exc:
@@ -97,11 +100,13 @@ def _handle_start_crawl(session: DashboardSession) -> None:
             selected,
             concurrency=session.concurrency,
             site_timeout_seconds=session.site_timeout_seconds,
+            llm_base_url=session.llm_base_url,
         )
     except Exception as exc:  # noqa: BLE001
         _show_message(f"抓取过程中出现未处理错误：{exc}")
         return
     session.current_key = result.effective_key
+    session.llm_base_url = result.llm_base_url or session.llm_base_url
     session.last_delivery_path = result.delivery_path
     wait_for_enter(f"任务完成：{result.delivery_path}\n按回车返回主菜单。")
 
@@ -292,9 +297,7 @@ def _open_folder(path: Path) -> None:
 def _display_key_status(session: DashboardSession) -> str:
     if not session.current_key:
         return "未设置"
-    if len(session.current_key) <= 4:
-        return "*" * len(session.current_key)
-    return "*" * (len(session.current_key) - 4) + session.current_key[-4:]
+    return "已设置"
 
 
 def _show_message(message: str) -> None:

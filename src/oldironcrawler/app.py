@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import sys
 import time
 
 from oldironcrawler.bootstrap import raise_nofile_soft_limit
@@ -11,7 +12,16 @@ from oldironcrawler.extractor.llm_client import LlmConfigurationError, LlmTempor
 from oldironcrawler.importer import choose_input_file, compute_rows_fingerprint, load_websites
 from oldironcrawler.llm_errors import classify_llm_exception
 from oldironcrawler.runner import run_crawl_session
+from oldironcrawler.runtime.llm_ingress import (
+    format_ingress_selection,
+    resolve_llm_ingress_nodes,
+    select_best_llm_ingress,
+)
 from oldironcrawler.runtime.store import RuntimeStore
+
+
+DEFAULT_SITE_CONCURRENCY = 64
+DEFAULT_SITE_TIMEOUT_SECONDS = 180
 
 
 @dataclass
@@ -19,6 +29,7 @@ class CrawlRunResult:
     exit_code: int
     delivery_path: Path
     effective_key: str
+    llm_base_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -36,7 +47,7 @@ def run_interactive(project_root: Path | None = None, llm_key_override: str | No
     current_key = _resolve_initial_llm_key(project_root, llm_key_override)
     config = _ensure_runtime_key_ready(project_root, current_key)
     input_path = choose_input_file(config.websites_dir)
-    result = run_selected_input(project_root, config.llm_key, input_path)
+    result = run_selected_input(project_root, config.llm_key, input_path, llm_base_url=config.llm_base_url)
     return result.exit_code
 
 
@@ -45,8 +56,9 @@ def run_selected_input(
     current_key: str,
     input_path: Path,
     *,
-    concurrency: int = 32,
-    site_timeout_seconds: int = 180,
+    concurrency: int = DEFAULT_SITE_CONCURRENCY,
+    site_timeout_seconds: int = DEFAULT_SITE_TIMEOUT_SECONDS,
+    llm_base_url: str = "",
 ) -> CrawlRunResult:
     config, rows, current_key = _load_rows_with_llm_recovery(
         project_root,
@@ -54,6 +66,7 @@ def run_selected_input(
         current_key,
         concurrency=concurrency,
         site_timeout_seconds=site_timeout_seconds,
+        llm_base_url=llm_base_url,
     )
     artifact_stem = _build_artifact_stem(input_path)
     db_path = config.runtime_dir / f"{artifact_stem}.sqlite3"
@@ -74,6 +87,7 @@ def run_selected_input(
             exit_code=exit_code,
             delivery_path=delivery_path,
             effective_key=effective_key,
+            llm_base_url=config.llm_base_url,
         )
     finally:
         store.close()
@@ -90,8 +104,10 @@ def _build_artifact_stem(input_path: Path) -> str:
     return f"{input_path.stem}-{suffix}"
 
 
-def _load_runtime_config(project_root: Path, llm_key_override: str) -> AppConfig:
+def _load_runtime_config(project_root: Path, llm_key_override: str, *, llm_base_url: str = "") -> AppConfig:
     config = AppConfig.load(project_root, llm_key_override=llm_key_override)
+    if str(llm_base_url or "").strip():
+        config.llm_base_url = str(llm_base_url or "").strip()
     config.ensure_directories()
     config.validate()
     return config
@@ -102,7 +118,11 @@ def _ensure_runtime_key_ready(project_root: Path, current_key: str) -> AppConfig
         if not str(current_key or "").strip():
             current_key = console_module.prompt_runtime_llm_key()
         config = _load_runtime_config(project_root, current_key)
-        _apply_runtime_preferences(config, concurrency=32, site_timeout_seconds=180)
+        _apply_runtime_preferences(
+            config,
+            concurrency=DEFAULT_SITE_CONCURRENCY,
+            site_timeout_seconds=DEFAULT_SITE_TIMEOUT_SECONDS,
+        )
         try:
             _validate_llm_runtime(config)
             _persist_runtime_llm_key(project_root, config.llm_key)
@@ -118,9 +138,11 @@ def _load_rows_with_llm_recovery(
     *,
     concurrency: int,
     site_timeout_seconds: int,
+    llm_base_url: str = "",
 ) -> tuple[AppConfig, list, str]:
+    selected_llm_base_url = str(llm_base_url or "").strip()
     while True:
-        config = _load_runtime_config(project_root, current_key)
+        config = _load_runtime_config(project_root, current_key, llm_base_url=selected_llm_base_url)
         _apply_runtime_preferences(
             config,
             concurrency=concurrency,
@@ -147,10 +169,11 @@ def _run_session_with_llm_recovery(
     site_timeout_seconds: int,
 ) -> tuple[int, str]:
     current_key = config.llm_key
+    selected_llm_base_url = config.llm_base_url
     fingerprint = compute_rows_fingerprint(rows)
     key_already_validated = True
     while True:
-        config = _load_runtime_config(project_root, current_key)
+        config = _load_runtime_config(project_root, current_key, llm_base_url=selected_llm_base_url)
         _apply_runtime_preferences(
             config,
             concurrency=concurrency,
@@ -159,6 +182,7 @@ def _run_session_with_llm_recovery(
         if not key_already_validated:
             try:
                 _validate_llm_runtime(config)
+                selected_llm_base_url = config.llm_base_url
             except (LlmConfigurationError, LlmTemporaryError) as exc:
                 current_key = _recover_runtime_llm_key(current_key, exc)
                 continue
@@ -208,11 +232,47 @@ def _retry_wait_seconds(retry_after_seconds: int | None) -> int:
 
 
 def _persist_runtime_llm_key(project_root: Path, llm_key: str) -> None:
+    if _is_packaged_runtime():
+        return
     persist_llm_key(project_root, llm_key)
 
 
+def _is_packaged_runtime() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
 def _validate_llm_runtime(config: AppConfig) -> None:
-    llm = WebsiteLlmClient(
+    nodes = resolve_llm_ingress_nodes(
+        primary_base_url=config.llm_base_url,
+        extra_base_urls=config.llm_base_urls,
+    )
+    try:
+        selection = select_best_llm_ingress(
+            api_key=config.llm_key,
+            model=config.llm_model,
+            reasoning_effort=config.llm_reasoning_effort,
+            nodes=nodes,
+            rounds=config.llm_ingress_rounds,
+            timeout_seconds=config.llm_ingress_timeout_seconds,
+            proxy_url=config.proxy_url,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _raise_classified_llm_validation_error(exc)
+    config.llm_base_url = selection.best.node.base_url
+    print(format_ingress_selection(selection), flush=True)
+
+
+def _raise_classified_llm_validation_error(exc: Exception) -> None:
+    failure = classify_llm_exception(exc)
+    if failure is None:
+        raise exc
+    if failure.prompt_mode == "new_key":
+        raise LlmConfigurationError(failure.user_message, failure=failure) from exc
+    raise LlmTemporaryError(failure.user_message, failure=failure) from exc
+
+
+def _build_llm_client(config: AppConfig) -> WebsiteLlmClient:
+    return WebsiteLlmClient(
         api_key=config.llm_key,
         base_url=config.llm_base_url,
         model=config.llm_model,
@@ -222,10 +282,6 @@ def _validate_llm_runtime(config: AppConfig) -> None:
         timeout_seconds=config.request_timeout_seconds * 2,
         concurrency_limit=config.llm_concurrency,
     )
-    try:
-        llm.ping()
-    finally:
-        llm.close()
 
 
 def _apply_runtime_preferences(
@@ -245,17 +301,13 @@ def _apply_runtime_preferences(
 
 
 def _derive_runtime_concurrency_budget(concurrency: int) -> RuntimeConcurrencyBudget:
-    site_concurrency = min(max(int(concurrency), 1), 64)
-    llm_concurrency = min(site_concurrency, max(min(site_concurrency // 4, 12), 4))
-    page_concurrency = min(site_concurrency, max(min(site_concurrency // 4 + 2, 12), 4))
-    page_worker_count = min(max(page_concurrency * 3, site_concurrency, 4), 32)
-    page_host_limit = min(max(page_concurrency // 3, 2), 4)
+    runtime_concurrency = min(max(int(concurrency), 1), 64)
     return RuntimeConcurrencyBudget(
-        site_concurrency=site_concurrency,
-        llm_concurrency=llm_concurrency,
-        page_concurrency=page_concurrency,
-        page_worker_count=page_worker_count,
-        page_host_limit=page_host_limit,
+        site_concurrency=runtime_concurrency,
+        llm_concurrency=runtime_concurrency,
+        page_concurrency=runtime_concurrency,
+        page_worker_count=runtime_concurrency,
+        page_host_limit=runtime_concurrency,
     )
 
 
@@ -274,16 +326,7 @@ def _format_runtime_budget(config: AppConfig) -> str:
 def _load_input_rows(config: AppConfig, input_path: Path):
     if input_path.suffix.lower() not in {".csv", ".xlsx"}:
         return load_websites(input_path)
-    llm = WebsiteLlmClient(
-        api_key=config.llm_key,
-        base_url=config.llm_base_url,
-        model=config.llm_model,
-        api_style=config.llm_api_style,
-        reasoning_effort=config.llm_reasoning_effort,
-        proxy_url=config.proxy_url,
-        timeout_seconds=config.request_timeout_seconds * 2,
-        concurrency_limit=config.llm_concurrency,
-    )
+    llm = _build_llm_client(config)
     try:
         return load_websites(input_path, website_column_picker=llm.pick_website_column)
     finally:

@@ -418,6 +418,8 @@ def _describe_error_reason(error_text: str) -> str:
         return "本地协议请求并发已打满，当前请求未成功"
     if any(token in lowered for token in ("failed to connect", "couldn't connect to server", "connection refused", "no route to host", "network is unreachable", "host is down")):
         return "站点当前明显无法连通，已直接停止重试"
+    if "site_open_timeout" in lowered:
+        return "站点主页打开超时，已跳过公共路径探测"
     if "timed out" in lowered or "timeout" in lowered:
         return "请求超时"
     if "service_temporarily_unavailable" in lowered or "llm 服务暂时不可用" in lowered:

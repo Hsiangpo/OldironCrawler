@@ -197,7 +197,7 @@ def test_store_failed_temp_goes_queue_tail_then_drops(tmp_path: Path) -> None:
     assert progress["dropped"] == 1
 
 
-def test_store_tls_transport_error_gets_extra_retry_budget(tmp_path: Path) -> None:
+def test_store_tls_transport_error_drops_without_extra_retry(tmp_path: Path) -> None:
     db_path = tmp_path / "runtime.sqlite3"
     store = RuntimeStore(db_path)
     rows = [
@@ -211,17 +211,8 @@ def test_store_tls_transport_error_gets_extra_retry_budget(tmp_path: Path) -> No
 
     first = store.claim_next_site()
     assert first is not None
-    assert store.mark_failed(first.id, error_text) == "failed_temp"
-
-    second = store.claim_next_site()
-    assert second is not None
-    assert second.id == first.id
-    assert store.mark_failed(second.id, error_text) == "failed_temp"
-
-    third = store.claim_next_site()
-    assert third is not None
-    assert third.id == first.id
-    assert store.mark_failed(third.id, error_text) == "dropped"
+    assert store.mark_failed(first.id, error_text) == "dropped"
+    assert store.claim_next_site() is None
 
     progress = store.progress()
     assert progress["failed_temp"] == 0
@@ -249,6 +240,29 @@ def test_store_llm_queue_timeout_gets_extra_retry_budget(tmp_path: Path) -> None
     assert third is not None
     assert third.id == first.id
     assert store.mark_failed(third.id, "llm_queue_timeout") == "dropped"
+
+
+def test_store_llm_service_unavailable_gets_extra_retry_budget(tmp_path: Path) -> None:
+    db_path = tmp_path / "runtime.sqlite3"
+    store = RuntimeStore(db_path)
+    rows = [
+        ImportedWebsite(input_index=1, raw_website="a.com", website="https://a.com", dedupe_key="a.com"),
+    ]
+    store.prepare_job(input_name="sites.txt", fingerprint="abc", rows=rows)
+
+    first = store.claim_next_site()
+    assert first is not None
+    assert store.mark_failed(first.id, "LLM 服务暂时不可用，请稍后重试。（service_temporarily_unavailable）") == "failed_temp"
+
+    second = store.claim_next_site()
+    assert second is not None
+    assert second.id == first.id
+    assert store.mark_failed(second.id, "LLM 服务暂时不可用，请稍后重试。（service_temporarily_unavailable）") == "failed_temp"
+
+    third = store.claim_next_site()
+    assert third is not None
+    assert third.id == first.id
+    assert store.mark_failed(third.id, "LLM 服务暂时不可用，请稍后重试。（service_temporarily_unavailable）") == "dropped"
 
 
 def test_store_empty_page_batch_gets_extra_retry_budget(tmp_path: Path) -> None:
@@ -611,35 +625,32 @@ def test_protocol_client_falls_back_to_httpx_on_dns_thread_error() -> None:
     assert "httpx fallback ok" in html
 
 
-def test_protocol_client_falls_back_to_httpx_on_tls_connect_error() -> None:
-    class FakeHttpxResponse:
-        def __init__(self, status_code: int, text: str, content_type: str = "text/html") -> None:
-            self.status_code = status_code
-            self.text = text
-            self.headers = {"Content-Type": content_type}
-
-    class FakeHttpxClient:
-        def get(self, url: str, timeout: float):
-            assert url == "https://example.com"
-            assert timeout == 10.0
-            return FakeHttpxResponse(200, "<html>tls httpx fallback ok</html>")
-
-        def close(self) -> None:
-            return None
-
+def test_protocol_client_fast_fails_tls_connect_error_without_fallback() -> None:
     class FakeSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
         def get(self, url: str, timeout: float):
+            self.calls += 1
             raise RuntimeError(
                 "Failed to perform, curl: (35) TLS connect error: "
                 "error:00000000:invalid library (0):OPENSSL_internal:invalid library (0)"
             )
 
     client = SiteProtocolClient(SiteProtocolConfig())
-    client._http_client = FakeHttpxClient()
+    session = FakeSession()
 
-    html = client._fetch_html(FakeSession(), "https://example.com", required=True)
+    def fail_fallback(*_args, **_kwargs):
+        raise AssertionError("TLS connect error should not use slower fallback probes")
 
-    assert "tls httpx fallback ok" in html
+    client._try_httpx_fallback = fail_fallback
+    client._try_insecure_https_fallback = fail_fallback
+    client._try_http_fallback = fail_fallback
+    client._try_www_fallback = fail_fallback
+
+    with pytest.raises(ProtocolPermanentError, match="TLS connect error"):
+        client._fetch_html(session, "https://example.com", required=True)
+    assert session.calls == 1
 
 
 def test_protocol_client_marks_cloudflare_challenge_as_permanent(monkeypatch) -> None:
@@ -955,7 +966,13 @@ def test_protocol_client_reuses_thread_session() -> None:
 
 def test_fetch_pages_batch_timeout_does_not_wait_forever() -> None:
     class SlowClient(SiteProtocolClient):
-        def _fetch_page_optional(self, url: str, *, timeout_seconds: float | None = None):
+        def _fetch_page_optional(
+            self,
+            url: str,
+            *,
+            timeout_seconds: float | None = None,
+            request_deadline_monotonic: float | None = None,
+        ):
             if url.endswith("/fast"):
                 return type("Page", (), {"url": url, "html": "<html>ok</html>"})()
             time.sleep(min(timeout_seconds or 0.2, 0.06))
@@ -971,6 +988,43 @@ def test_fetch_pages_batch_timeout_does_not_wait_forever() -> None:
 
     assert elapsed < 0.15
     assert [page.url for page in pages] == ["https://example.com/fast"]
+
+
+def test_fetch_pages_propagates_batch_deadline_into_page_fetch_pool() -> None:
+    class FakePool:
+        def __init__(self) -> None:
+            self.captured_deadlines: list[float | None] = []
+
+        def fetch_pages(self, *, urls: list[str], fetch_one, deadline_monotonic: float) -> list:
+            fetch_one(urls[0])
+            return []
+
+    client = SiteProtocolClient(SiteProtocolConfig(page_batch_timeout_seconds=0.2))
+    fake_pool = FakePool()
+
+    def fake_fetch_page_optional(
+        _url: str,
+        *,
+        timeout_seconds: float | None = None,
+        request_deadline_monotonic: float | None = None,
+    ):
+        fake_pool.captured_deadlines.append(request_deadline_monotonic)
+        return None
+
+    client._fetch_page_optional = fake_fetch_page_optional
+
+    try:
+        client.fetch_pages(
+            ["https://example.com/about"],
+            max_workers=1,
+            page_pool=fake_pool,
+        )
+    except ProtocolTemporaryError:
+        pass
+
+    assert fake_pool.captured_deadlines
+    assert fake_pool.captured_deadlines[0] is not None
+    client.close()
 
 
 def test_protocol_client_default_headers_allow_keepalive() -> None:
@@ -2777,3 +2831,20 @@ def test_request_slot_times_out_when_global_slots_are_exhausted(monkeypatch) -> 
             raise AssertionError("should not enter request slot")
     except RuntimeError as exc:
         assert "request_slot_timeout" in str(exc)
+
+
+def test_request_slot_wait_timeout_can_exceed_http_request_timeout(monkeypatch) -> None:
+    semaphore = threading.BoundedSemaphore(1)
+    assert semaphore.acquire(timeout=0.01) is True
+    monkeypatch.setattr(protocol_runtime_module, "_REQUEST_SLOT_SEMAPHORE", semaphore)
+    monkeypatch.setattr(protocol_runtime_module, "_REQUEST_SLOT_LIMIT", 1)
+
+    releaser = threading.Timer(0.05, semaphore.release)
+    releaser.start()
+    try:
+        started = time.monotonic()
+        with protocol_runtime_module.request_slot(timeout_seconds=0.01, wait_timeout_seconds=0.2):
+            elapsed = time.monotonic() - started
+        assert elapsed >= 0.04
+    finally:
+        releaser.cancel()

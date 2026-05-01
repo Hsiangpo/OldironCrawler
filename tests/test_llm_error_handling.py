@@ -19,6 +19,7 @@ from oldironcrawler import dashboard as dashboard_module
 from oldironcrawler.extractor import llm_client as llm_module
 from oldironcrawler.extractor.llm_client import LlmConfigurationError, LlmTemporaryError, WebsiteLlmClient
 from oldironcrawler.importer import ImportedWebsite
+from oldironcrawler.runtime import llm_ingress
 from oldironcrawler.runtime.store import RuntimeStore
 
 
@@ -53,6 +54,259 @@ class _FakeRuntimeStore:
 
     def close(self) -> None:
         self.closed = True
+
+
+def test_gpteam_base_url_expands_to_all_production_ingress_nodes() -> None:
+    nodes = llm_ingress.resolve_llm_ingress_nodes(
+        primary_base_url="https://api.gpteamservices.com/v1",
+        extra_base_urls=[],
+    )
+
+    assert [node.id for node in nodes] == ["jp-direct", "jp-split", "hk-split", "us-split"]
+
+
+def test_select_best_llm_ingress_prefers_full_success_then_latency() -> None:
+    nodes = [
+        llm_ingress.LlmIngressNode("slow", "慢入口", "https://slow.example/v1", "https://slow.example/api/health"),
+        llm_ingress.LlmIngressNode("lossy", "丢包入口", "https://lossy.example/v1", "https://lossy.example/api/health"),
+        llm_ingress.LlmIngressNode("fast", "快入口", "https://fast.example/v1", "https://fast.example/api/health"),
+    ]
+    call_order: list[str] = []
+
+    def fake_probe(node, _options):
+        call_order.append(node.id)
+        if node.id == "lossy" and call_order.count("lossy") == 2:
+            return llm_ingress.LlmIngressProbe(ok=False, first_event_ms=None, total_ms=90.0, error="stream timeout")
+        if node.id == "slow":
+            return llm_ingress.LlmIngressProbe(ok=True, first_event_ms=120.0, total_ms=220.0)
+        return llm_ingress.LlmIngressProbe(ok=True, first_event_ms=40.0, total_ms=90.0)
+
+    selection = llm_ingress.select_best_llm_ingress(
+        api_key="test-key",
+        model="gpt-5.4-mini",
+        reasoning_effort="low",
+        nodes=nodes,
+        rounds=2,
+        timeout_seconds=1.0,
+        benchmark_probe=fake_probe,
+    )
+
+    assert selection.best.node.id == "fast"
+    assert selection.best.success_rate == 1.0
+    assert len(call_order) == 6
+
+
+def test_benchmark_llm_ingress_uses_configured_proxy(monkeypatch) -> None:
+    seen_client_kwargs: dict[str, object] = {}
+
+    class FakeResponse:
+        status_code = 200
+        is_success = True
+        text = ""
+
+        def read(self) -> bytes:
+            return b""
+
+        def json(self) -> dict[str, object]:
+            return {}
+
+    class FakeStreamResponse:
+        status_code = 200
+        is_success = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc, _tb) -> None:
+            return None
+
+        def iter_lines(self):
+            yield 'data: {"type":"response.output_text.delta"}'
+            yield "data: [DONE]"
+
+    class FakeClient:
+        def __init__(self, **kwargs) -> None:
+            seen_client_kwargs.update(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc, _tb) -> None:
+            return None
+
+        def get(self, _url: str, **_kwargs):
+            return FakeResponse()
+
+        def stream(self, *_args, **_kwargs):
+            return FakeStreamResponse()
+
+    node = llm_ingress.LlmIngressNode("fast", "快入口", "https://fast.example/v1", "https://fast.example/api/health")
+    options = llm_ingress.LlmIngressBenchmarkOptions(
+        api_key="test-key",
+        model="gpt-5.4-mini",
+        reasoning_effort="low",
+        timeout_seconds=3.0,
+        proxy_url="http://127.0.0.1:7897",
+    )
+    monkeypatch.setattr(llm_ingress.httpx, "Client", FakeClient)
+
+    probe = llm_ingress.benchmark_llm_ingress_once(node, options)
+
+    assert probe.ok is True
+    assert seen_client_kwargs["proxy"] == "http://127.0.0.1:7897"
+    assert seen_client_kwargs["trust_env"] is False
+
+
+def test_ingress_stream_probe_stops_at_total_deadline(monkeypatch) -> None:
+    class FakeStreamResponse:
+        status_code = 200
+        is_success = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc, _tb) -> None:
+            return None
+
+        def iter_lines(self):
+            yield ": keepalive"
+
+    class FakeClient:
+        def stream(self, *_args, **_kwargs):
+            return FakeStreamResponse()
+
+    node = llm_ingress.LlmIngressNode("slow", "慢入口", "https://slow.example/v1", "https://slow.example/api/health")
+    options = llm_ingress.LlmIngressBenchmarkOptions(
+        api_key="test-key",
+        model="gpt-5.4-mini",
+        reasoning_effort="low",
+        timeout_seconds=3.0,
+    )
+    times = iter([0.0, 2.0])
+    monkeypatch.setattr(llm_ingress.time, "perf_counter", lambda: next(times))
+
+    result = llm_ingress._probe_response_stream(FakeClient(), node, options, started=0.0, deadline=1.0)
+
+    assert result.ok is False
+    assert result.error == "入口测速超时"
+
+
+def test_frozen_llm_client_ignores_tls_verify_env(monkeypatch) -> None:
+    seen_client_kwargs: dict[str, object] = {}
+
+    class FakeHttpClient:
+        def __init__(self, **kwargs) -> None:
+            seen_client_kwargs.update(kwargs)
+
+        def close(self) -> None:
+            return None
+
+    class FakeOpenAI:
+        def __init__(self, **_kwargs) -> None:
+            return None
+
+    monkeypatch.setenv("LLM_TLS_VERIFY", "0")
+    monkeypatch.setattr(llm_module.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(llm_module.httpx, "Client", FakeHttpClient)
+    monkeypatch.setattr(llm_module, "OpenAI", FakeOpenAI)
+
+    client = WebsiteLlmClient(
+        api_key="test-key",
+        base_url="https://example.com/v1",
+        model="gpt-5.4-mini",
+        api_style="responses",
+        reasoning_effort="low",
+        proxy_url="",
+        timeout_seconds=3.0,
+        concurrency_limit=1,
+    )
+    client.close()
+
+    assert "verify" not in seen_client_kwargs
+
+
+def test_validate_llm_runtime_applies_selected_ingress(tmp_path: Path, monkeypatch, capsys) -> None:
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "LLM_BASE_URL=https://api.gpteamservices.com/v1",
+                "LLM_BASE_URLS=https://custom.example/v1",
+                "LLM_KEY=good-key",
+                "LLM_MODEL=gpt-5.4-mini",
+                "PROXY_URL=http://127.0.0.1:7897",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("oldironcrawler.config._local_proxy_is_ready", lambda _proxy_url: True)
+    config = app_module._load_runtime_config(tmp_path, "good-key")
+    selected_node = llm_ingress.LlmIngressNode(
+        "fast",
+        "快入口",
+        "https://fast.example/v1",
+        "https://fast.example/api/health",
+    )
+    selected = llm_ingress.LlmIngressSelection(
+        best=llm_ingress.LlmIngressResult(
+            node=selected_node,
+            samples=[llm_ingress.LlmIngressProbe(ok=True, first_event_ms=30.0, total_ms=70.0)],
+        ),
+        results=[],
+    )
+    seen: dict[str, object] = {}
+
+    def fake_select(**kwargs):
+        seen.update(kwargs)
+        return selected
+
+    monkeypatch.setattr(app_module, "select_best_llm_ingress", fake_select)
+
+    app_module._validate_llm_runtime(config)
+
+    assert config.llm_base_url == "https://fast.example/v1"
+    assert seen["api_key"] == "good-key"
+    assert seen["proxy_url"] == "http://127.0.0.1:7897"
+    assert any(node.base_url == "https://custom.example/v1" for node in seen["nodes"])
+    assert "已选择 LLM API 入口：快入口" in capsys.readouterr().out
+
+
+def test_run_selected_input_uses_selected_ingress_for_rows_and_crawl(tmp_path: Path, monkeypatch) -> None:
+    workbook = tmp_path / "sites.xlsx"
+    workbook.write_text("", encoding="utf-8")
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "LLM_BASE_URL=https://api.gpteamservices.com/v1",
+                "LLM_KEY=good-key",
+                "LLM_MODEL=gpt-5.4-mini",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    rows = [ImportedWebsite(input_index=1, raw_website="acme.com", website="https://acme.com", dedupe_key="acme.com")]
+    seen: list[str] = []
+
+    def fake_load_rows(config, _input_path: Path):
+        seen.append(f"load:{config.llm_base_url}")
+        return rows
+
+    def fake_run(config, _store, _delivery_path) -> None:
+        seen.append(f"run:{config.llm_base_url}")
+
+    monkeypatch.setattr(app_module, "_load_input_rows", fake_load_rows)
+    monkeypatch.setattr(app_module, "RuntimeStore", _FakeRuntimeStore)
+    monkeypatch.setattr(app_module, "run_crawl_session", fake_run)
+
+    result = app_module.run_selected_input(
+        tmp_path,
+        "good-key",
+        workbook,
+        llm_base_url="https://fast.example/v1",
+    )
+
+    assert result.exit_code == 0
+    assert result.llm_base_url == "https://fast.example/v1"
+    assert seen == ["load:https://fast.example/v1", "run:https://fast.example/v1"]
 
 
 def test_classify_invalid_api_key_requires_new_key() -> None:

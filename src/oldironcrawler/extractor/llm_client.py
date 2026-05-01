@@ -5,6 +5,7 @@ import importlib.util
 import os
 import random
 import re
+import sys
 import time
 import threading
 from dataclasses import dataclass
@@ -123,8 +124,7 @@ class WebsiteLlmClient:
         }
         if proxy_url:
             client_kwargs["proxy"] = proxy_url
-        verify_mode = str(os.getenv("LLM_TLS_VERIFY", "auto") or "auto").strip().lower()
-        if verify_mode in {"0", "false", "no", "off"}:
+        if _llm_tls_verify_disabled_by_env():
             client_kwargs["verify"] = False
         self._http_client = httpx.Client(**client_kwargs)
         self._client = OpenAI(
@@ -485,6 +485,13 @@ def _get_llm_semaphore() -> threading.Semaphore:
 
 def _http2_is_available() -> bool:
     return importlib.util.find_spec("h2") is not None
+
+
+def _llm_tls_verify_disabled_by_env() -> bool:
+    if bool(getattr(sys, "frozen", False)):
+        return False
+    verify_mode = str(os.getenv("LLM_TLS_VERIFY", "auto") or "auto").strip().lower()
+    return verify_mode in {"0", "false", "no", "off"}
 
 
 def _sleep_with_jitter(

@@ -2,14 +2,23 @@ from __future__ import annotations
 
 import sys
 import time
+from concurrent.futures import Future
 from pathlib import Path
+
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from oldironcrawler.extractor.protocol_client import SiteProtocolClient, SiteProtocolConfig
+from oldironcrawler.extractor import protocol_client as protocol_module
+from oldironcrawler.extractor.protocol_client import (
+    ProtocolPermanentError,
+    ProtocolTemporaryError,
+    SiteProtocolClient,
+    SiteProtocolConfig,
+)
 from oldironcrawler.extractor.protocol_discovery import extract_same_site_links
 from oldironcrawler.extractor.service import _build_discovery_snapshot, _has_enough_discovery_coverage
 from oldironcrawler.extractor.value_rules import build_candidates, select_email_urls
@@ -75,6 +84,49 @@ def test_common_probe_batch_respects_batch_timeout_without_waiting_for_slow_futu
 
     assert urls == []
     assert elapsed < 0.15
+    client.close()
+
+
+def test_common_probe_batch_caps_wait_below_site_deadline(monkeypatch) -> None:
+    client = SiteProtocolClient(SiteProtocolConfig(timeout_seconds=180.0, common_probe_concurrency=2))
+    captured_timeouts: list[float] = []
+
+    class FakeExecutor:
+        def submit(self, *_args, **_kwargs):
+            return Future()
+
+    def fake_wait(_keys, timeout=None, return_when=None):
+        captured_timeouts.append(float(timeout))
+        return set(), set()
+
+    monkeypatch.setattr(protocol_module, "get_probe_executor", lambda: FakeExecutor())
+    monkeypatch.setattr(protocol_module, "wait", fake_wait)
+
+    urls = client._probe_common_value_batch(["https://example.com/about"])
+
+    assert urls == []
+    assert captured_timeouts
+    assert captured_timeouts[0] <= 6.0
+    client.close()
+
+
+def test_primary_discovery_skips_common_probe_after_homepage_timeout(monkeypatch) -> None:
+    client = SiteProtocolClient(SiteProtocolConfig(timeout_seconds=180.0))
+
+    def fake_fetch_html(_session, _url: str, **kwargs) -> str:
+        assert kwargs["max_retries_override"] == 0
+        assert kwargs["timeout_seconds"] <= 20.0
+        raise ProtocolTemporaryError("Failed to perform, curl: (28) Operation timed out")
+
+    def fail_probe(*_args, **_kwargs):
+        raise AssertionError("主页打开超时后不应继续扫公共路径")
+
+    monkeypatch.setattr(client, "_fetch_html", fake_fetch_html)
+    monkeypatch.setattr(client, "_probe_common_value_urls", fail_probe)
+
+    with pytest.raises(ProtocolPermanentError, match="site_open_timeout"):
+        client._discover_primary_urls(object(), "https://slow.example", limit=20)
+
     client.close()
 
 
